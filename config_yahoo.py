@@ -3,12 +3,11 @@
 Configuração para sincronização Yahoo Finance → Supabase
 
 IMPORTANTE — unidades:
-  ZS=F (Soja)  e ZC=F (Milho): cotados em USd/bushel (centavos de USD).
-  KC=F (Café): cotado em USd/lb (centavos de USD).
-  LE=F (Boi Gordo): cotado em USD/cwt (dólares — sem divisor).
+  ZS=F (Soja), ZC=F (Milho), KC=F (Café), ZW=F (Trigo):
+    Cotados em USd/bushel ou USd/lb (centavos de USD na CBOT).
+    divisor=100 converte USd → USD antes de salvar.
+  LE=F (Boi Gordo): cotado em USD/cwt — já em dólares, divisor=1.
 
-  O yfinance retorna o valor como aparece na CBOT (ex: soja 1126 = 1126 USd).
-  Dividimos por 100 para converter USd → USD antes de salvar no banco.
   O trigger calcular_preco_convertido cuida do USD → BRL automaticamente.
 """
 
@@ -20,6 +19,7 @@ PRODUTOS = {
     'cafe_arabica': 'b65effe8-94fb-4f73-8404-7bdeddb74565',
     'soja':         'f1fe7635-add9-4a03-b542-a27a57848682',
     'milho':        '553e75be-a732-4ff5-9b93-11bb8861114a',
+    'trigo':        '01340329-fc80-4598-a94a-80e3fb7cf9dc',
 }
 
 YAHOO_CONFIG = [
@@ -46,6 +46,14 @@ YAHOO_CONFIG = [
         'regiao_id':  REGIAO_NACIONAL_ID,
         'moeda':      'USD',
         'divisor':    100,   # USd/lb → USD/lb
+    },
+    {
+        'nome':       'Trigo',
+        'ticker':     'ZW=F',
+        'produto_id': PRODUTOS['trigo'],
+        'regiao_id':  REGIAO_NACIONAL_ID,
+        'moeda':      'USD',
+        'divisor':    100,   # USd/bushel → USD/bushel
     },
     {
         'nome':       'Boi Gordo',
