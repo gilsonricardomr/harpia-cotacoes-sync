@@ -321,13 +321,11 @@ def sincronizar_investing(supabase: Client, dias: int = 1) -> dict:
         from selenium.webdriver.support.ui import WebDriverWait
         from selenium.webdriver.support import expected_conditions as EC
     except ImportError:
-        return {'fonte': 'Investing.com', 'inseridos': 0, 'erros': 0,
-                'aviso': 'Selenium não instalado'}
+        return {'fonte': 'Investing.com', 'inseridos': 0, 'erros': 0, 'aviso': 'Selenium não instalado'}
 
     driver = _criar_driver()
     if not driver:
-        return {'fonte': 'Investing.com', 'inseridos': 0, 'erros': 0,
-                'aviso': 'Falha ao iniciar o navegador'}
+        return {'fonte': 'Investing.com', 'inseridos': 0, 'erros': 0, 'aviso': 'Falha ao iniciar o navegador'}
 
     todas_cotacoes = []
     try:
@@ -366,8 +364,7 @@ def sincronizar_investing(supabase: Client, dias: int = 1) -> dict:
                     driver.get(url)
                     try:
                         WebDriverWait(driver, 20).until(
-                            EC.presence_of_element_located(
-                                (By.CSS_SELECTOR, 'table tbody tr td')))
+                            EC.presence_of_element_located((By.CSS_SELECTOR, 'table tbody tr td')))
                     except Exception:
                         time.sleep(10)
                     soup   = BeautifulSoup(driver.page_source, 'html.parser')
@@ -413,6 +410,8 @@ def sincronizar_investing(supabase: Client, dias: int = 1) -> dict:
 
 # ============================================================
 # FONTE 5 — YAHOO FINANCE (yfinance)
+# CORREÇÃO: tickers CBOT (ZS, ZC, KC) são cotados em USd (centavos).
+# Dividimos pelo campo 'divisor' do config antes de salvar.
 # ============================================================
 
 def sincronizar_yahoo(supabase: Client, dias: int = 1) -> dict:
@@ -429,7 +428,8 @@ def sincronizar_yahoo(supabase: Client, dias: int = 1) -> dict:
     period = '1d' if dias == 1 else f'{dias}d'
 
     for config in YAHOO_CONFIG:
-        print(f"   📊 {config['nome']} ({config['ticker']})")
+        divisor = config.get('divisor', 1)
+        print(f"   📊 {config['nome']} ({config['ticker']}) — divisor: {divisor}")
         try:
             ticker = yf.Ticker(config['ticker'])
             hist   = ticker.history(period=period)
@@ -438,7 +438,8 @@ def sincronizar_yahoo(supabase: Client, dias: int = 1) -> dict:
                 continue
             for data_idx, row in hist.iterrows():
                 data_iso = data_idx.strftime('%Y-%m-%d')
-                preco    = round(float(row['Close']), 4)
+                # Divide pelo divisor para converter USd → USD quando necessário
+                preco    = round(float(row['Close']) / divisor, 4)
                 reg = {
                     'produto_id':   config['produto_id'],
                     'fonte_id':     YAHOO_FONTE_ID,
@@ -515,7 +516,7 @@ def sincronizar_alpha(supabase: Client, dias: int = 1) -> dict:
                 count += 1
 
             print(f"   ✅ {count} registros")
-            time.sleep(13)  # respeita limite de 5 req/min do plano free
+            time.sleep(13)  # respeita limite 5 req/min do plano free
 
         except Exception as e:
             print(f"   ⚠️  Erro em {config['nome']}: {e}")
