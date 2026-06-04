@@ -2,10 +2,11 @@ name: Sincronizar Cotações
 
 on:
   schedule:
-    # Roda todo dia às 21h UTC = 18h BRT (após fechamento dos mercados)
-    - cron: '0 21 * * 1-5'
+    # 09h15 BRT = 12h15 UTC
+    - cron: '15 12 * * 1-5'
+    # 16h15 BRT = 19h15 UTC
+    - cron: '15 19 * * 1-5'
   workflow_dispatch:
-    # Permite rodar manualmente pela aba Actions do GitHub
     inputs:
       dias:
         description: 'Dias retroativos a buscar'
@@ -42,6 +43,8 @@ jobs:
 
       - name: Instalar Chrome e ChromeDriver (para Investing.com)
         uses: browser-actions/setup-chrome@v1
+        with:
+          chrome-version: stable
 
       - name: Rodar sincronização
         env:
