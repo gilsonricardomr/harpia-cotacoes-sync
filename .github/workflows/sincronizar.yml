@@ -1,0 +1,62 @@
+name: Sincronizar Cotações
+
+on:
+  schedule:
+    # Roda todo dia às 21h UTC = 18h BRT (após fechamento dos mercados)
+    - cron: '0 21 * * 1-5'
+  workflow_dispatch:
+    # Permite rodar manualmente pela aba Actions do GitHub
+    inputs:
+      dias:
+        description: 'Dias retroativos a buscar'
+        required: false
+        default: '1'
+      fonte:
+        description: 'Fonte específica (dolar/selic/ipca/investing/yahoo/alpha) — deixe vazio para todas'
+        required: false
+        default: ''
+
+jobs:
+  sincronizar:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout do repositório
+        uses: actions/checkout@v4
+
+      - name: Configurar Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Cache de dependências pip
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('requirements.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-
+
+      - name: Instalar dependências
+        run: pip install -r requirements.txt
+
+      - name: Instalar Chrome e ChromeDriver (para Investing.com)
+        uses: browser-actions/setup-chrome@v1
+
+      - name: Rodar sincronização
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+          ALPHA_VANTAGE_KEY: ${{ secrets.ALPHA_VANTAGE_KEY }}
+        run: |
+          DIAS=${{ github.event.inputs.dias || '1' }}
+          FONTE=${{ github.event.inputs.fonte || '' }}
+          if [ -n "$FONTE" ]; then
+            python sincronizar.py --dias $DIAS --fonte $FONTE
+          else
+            python sincronizar.py --dias $DIAS
+          fi
+
+      - name: Resultado
+        if: always()
+        run: echo "Sincronização finalizada em $(TZ=America/Sao_Paulo date '+%Y-%m-%d %H:%M:%S BRT')"
