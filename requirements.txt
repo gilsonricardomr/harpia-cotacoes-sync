@@ -4,11 +4,11 @@
 requests>=2.31.0
 beautifulsoup4>=4.12.0
 
-# Selenium (Investing.com — requer Chrome no ambiente)
+# Selenium (Investing.com e CEPEA — requer Chrome no ambiente)
 selenium>=4.15.0
 
-# Yahoo Finance (sem Selenium, sem autenticação)
-yfinance>=0.2.40
+# ChromeDriver automático — resolve compatibilidade no GitHub Actions
+webdriver-manager>=4.0.0
 
 # Supabase
 supabase>=2.0.0
