@@ -3,19 +3,16 @@
 """
 Script unificado de sincronização → Supabase
 
-Fontes:
-  1. Dólar BCB          → mercado_indicadores
-  2. SELIC BCB          → mercado_indicadores
-  3. IPCA BCB           → mercado_indicadores
-  4. Investing.com      → mercado_cotacoes  (curl_cffi, dados históricos do mês atual)
-  5. CEPEA/ESALQ        → mercado_cotacoes  (Selenium) — feijão, arroz
+Fontes e horários:
+  09h15 BRT → bcb + cafe_milho + cepea
+  10h17 BRT → soja_boi
 
-Estratégia Investing.com:
-  - Sempre usa a URL histórica (mais estável que a página atual)
-  - Busca do dia 1 do mês atual até hoje
-  - Antes de inserir: zera preco_brl e preco_usd dos registros do período
-    para forçar o trigger a recalcular a conversão com o dólar mais recente
-  - O campo --dias é ignorado para o Investing (sempre usa mês atual)
+Uso:
+  python sincronizar.py --fonte bcb
+  python sincronizar.py --fonte cafe_milho
+  python sincronizar.py --fonte soja_boi
+  python sincronizar.py --fonte cepea
+  python sincronizar.py              → todas as fontes
 """
 
 import os, sys, re, time, argparse, traceback
@@ -51,9 +48,18 @@ CHROME_BINARY_PATHS = [
     '/usr/bin/chromium',
 ]
 
-# Tempos de espera Investing.com
-INVESTING_SLEEP_RETRY   = 30  # entre tentativas 403
-INVESTING_SLEEP_PRODUTO = 24  # entre produtos
+# IDs dos produtos do Investing.com para filtrar por grupo
+INVESTING_CAFE_MILHO = {
+    'b65effe8-94fb-4f73-8404-7bdeddb74565',  # Café Arábica
+    '553e75be-a732-4ff5-9b93-11bb8861114a',  # Milho
+}
+INVESTING_SOJA_BOI = {
+    'f1fe7635-add9-4a03-b542-a27a57848682',  # Soja
+    '9e382636-0b57-482b-a836-522da43b6228',  # Boi Gordo
+}
+
+INVESTING_SLEEP_RETRY   = 30
+INVESTING_SLEEP_PRODUTO = 24
 
 
 def conectar_supabase():
@@ -79,14 +85,7 @@ def upsert_indicadores(supabase, registros):
     except Exception as e:
         print(f"   ❌ Erro indicadores: {e}"); return 0, len(registros)
 
-def limpar_precos_cotacoes(supabase, produto_id: str, fonte_id: str, regiao_id: str,
-                            data_inicio: str, data_fim: str) -> int:
-    """
-    Zera preco_brl e preco_usd dos registros do período antes do upsert.
-    Isso força o trigger calcular_preco_convertido a recalcular a conversão
-    com o dólar mais recente quando o novo valor for inserido.
-    Retorna o número de registros zerados.
-    """
+def limpar_precos_cotacoes(supabase, produto_id, fonte_id, regiao_id, data_inicio, data_fim):
     try:
         resp = (supabase.table('mercado_cotacoes')
             .update({'preco_brl': None, 'preco_usd': None})
@@ -97,12 +96,10 @@ def limpar_precos_cotacoes(supabase, produto_id: str, fonte_id: str, regiao_id: 
             .lte('data_cotacao', data_fim)
             .execute())
         n = len(resp.data) if resp.data else 0
-        if n > 0:
-            print(f"   🔄 {n} registros zerados (aguarda recálculo pelo trigger)")
+        if n > 0: print(f"   🔄 {n} registros zerados (trigger vai recalcular)")
         return n
     except Exception as e:
-        print(f"   ⚠️  Erro ao zerar preços: {e}")
-        return 0
+        print(f"   ⚠️  Erro ao zerar preços: {e}"); return 0
 
 
 # ── BCB ──────────────────────────────────────────────────────
@@ -185,8 +182,19 @@ def sincronizar_ipca(supabase, dias=1):
     except Exception as e:
         return {'fonte':'IPCA BCB','inseridos':0,'erros':1,'excecao':str(e)}
 
+def sincronizar_bcb(supabase, dias=1):
+    """Agrupa Dólar + SELIC + IPCA numa única chamada."""
+    print("\n" + "═"*60 + "\n🏦  BCB — INDICADORES\n" + "═"*60)
+    resultados = []
+    resultados.append(sincronizar_dolar(supabase, dias))
+    resultados.append(sincronizar_selic(supabase, dias))
+    resultados.append(sincronizar_ipca(supabase, dias))
+    total_ok  = sum(r.get('inseridos',0) for r in resultados)
+    total_err = sum(r.get('erros',0) for r in resultados)
+    return {'fonte':'BCB','inseridos':total_ok,'erros':total_err}
 
-# ── Helpers de parsing ────────────────────────────────────────
+
+# ── Helpers Investing ─────────────────────────────────────────
 
 def _limpar_numero(t):
     if not t: return None
@@ -225,57 +233,44 @@ def _detectar_moeda(soup):
         return e.get_text(strip=True).upper()
     return 'BRL'
 
-
-# ── Investing.com (curl_cffi + histórico do mês) ──────────────
-
-def _fetch_investing(url: str, tentativas: int = 3) -> BeautifulSoup | None:
+def _fetch_investing(url):
     try:
         from curl_cffi import requests as cf
     except ImportError:
         print("   ❌ curl_cffi não instalado"); return None
 
-    for i in range(tentativas):
+    for i in range(3):
         try:
-            resp = cf.get(
-                url,
-                impersonate="chrome120",
-                timeout=30,
-                headers={
-                    'Accept-Language': 'pt-BR,pt;q=0.9,en;q=0.8',
-                    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-                    'Referer': 'https://br.investing.com/',
-                }
-            )
+            resp = cf.get(url, impersonate="chrome120", timeout=30,
+                headers={'Accept-Language':'pt-BR,pt;q=0.9','Referer':'https://br.investing.com/'})
             if resp.status_code == 200:
-                titulo = BeautifulSoup(resp.text,'html.parser').find('title')
-                titulo_txt = titulo.text.strip() if titulo else ''
-                if 'Just a moment' in titulo_txt or 'Attention Required' in titulo_txt:
-                    print(f"   ⚠️  Cloudflare ativo (tentativa {i+1}/{tentativas}) — aguardando {INVESTING_SLEEP_RETRY}s")
-                    time.sleep(INVESTING_SLEEP_RETRY)
-                    continue
-                return BeautifulSoup(resp.text, 'html.parser')
+                soup = BeautifulSoup(resp.text,'html.parser')
+                titulo = (soup.find('title') or object()).__dict__.get('string','') or ''
+                if 'Just a moment' in titulo or 'Attention Required' in titulo:
+                    print(f"   ⚠️  Cloudflare ativo (tentativa {i+1}/3) — aguardando {INVESTING_SLEEP_RETRY}s")
+                    time.sleep(INVESTING_SLEEP_RETRY); continue
+                return soup
             else:
-                print(f"   ⚠️  HTTP {resp.status_code} (tentativa {i+1}/{tentativas}) — aguardando {INVESTING_SLEEP_RETRY}s")
+                print(f"   ⚠️  HTTP {resp.status_code} (tentativa {i+1}/3) — aguardando {INVESTING_SLEEP_RETRY}s")
                 time.sleep(INVESTING_SLEEP_RETRY)
         except Exception as e:
-            print(f"   ⚠️  Erro (tentativa {i+1}/{tentativas}): {e}")
-            time.sleep(INVESTING_SLEEP_RETRY)
+            print(f"   ⚠️  Erro (tentativa {i+1}/3): {e}"); time.sleep(INVESTING_SLEEP_RETRY)
     return None
 
+def _sincronizar_investing_grupo(supabase, grupo_ids: set, nome_grupo: str):
+    """Sincroniza apenas os produtos cujo produto_id esteja em grupo_ids."""
+    hoje     = date.today()
+    data_ini = hoje.replace(day=1).isoformat()
+    data_fim = hoje.isoformat()
 
-def sincronizar_investing(supabase, dias=1):
-    # dias ignorado — sempre busca do dia 1 do mês atual até hoje
-    hoje       = date.today()
-    data_ini   = hoje.replace(day=1).isoformat()   # ex: 2026-06-01
-    data_fim   = hoje.isoformat()                  # ex: 2026-06-04
-
-    print("\n" + "─"*60 +
-          f"\n📈  INVESTING.COM  [histórico: {data_ini} → {data_fim}]\n" + "─"*60)
+    print("\n" + "═"*60 +
+          f"\n📈  INVESTING.COM — {nome_grupo}  [{data_ini} → {data_fim}]\n" + "═"*60)
     print(f"   ⏱️  Sleep entre produtos: {INVESTING_SLEEP_PRODUTO}s | entre tentativas: {INVESTING_SLEEP_RETRY}s")
 
+    configs = [c for c in SCRAPING_CONFIG if c['produto_id'] in grupo_ids]
     cotacoes = []
 
-    for idx, cfg in enumerate(SCRAPING_CONFIG):
+    for idx, cfg in enumerate(configs):
         print(f"\n   📊 {cfg['nome']}")
         if idx > 0:
             print(f"   ⏳ Aguardando {INVESTING_SLEEP_PRODUTO}s...")
@@ -283,66 +278,49 @@ def sincronizar_investing(supabase, dias=1):
         try:
             soup = _fetch_investing(cfg['url_historico'])
             if not soup:
-                print(f"   ❌ Falha ao obter página histórica"); continue
+                print(f"   ❌ Falha ao obter página"); continue
 
             moeda = _detectar_moeda(soup)
-
-            # Encontra a tabela histórica
             tab = None
             for c in [soup.find('table',{'id':re.compile(r'curr_table|historicalTbl',re.I)}),
                        soup.find('table',class_=re.compile(r'freeze-column-w-1|historical',re.I))]:
                 if c and c.find('tbody'): tab=c; break
             if not tab:
                 for t in soup.find_all('table'):
-                    if t.find('tbody') and len(t.find('tbody').find_all('tr')) > 3:
-                        tab=t; break
+                    if t.find('tbody') and len(t.find('tbody').find_all('tr')) > 3: tab=t; break
 
             if not tab:
                 print(f"   ⚠️  Tabela histórica não encontrada"); continue
 
-            # Zera preços do período antes de inserir
-            # (força trigger a recalcular conversão com dólar atual)
-            limpar_precos_cotacoes(
-                supabase,
-                produto_id  = cfg['produto_id'],
-                fonte_id    = INVESTING_FONTE_ID,
-                regiao_id   = cfg['regiao_id'],
-                data_inicio = data_ini,
-                data_fim    = data_fim,
-            )
-
-            # Parseia linhas da tabela filtrando pelo mês atual
+            limpar_precos_cotacoes(supabase, cfg['produto_id'], INVESTING_FONTE_ID,
+                                   cfg['regiao_id'], data_ini, data_fim)
             count = 0
             for linha in tab.find('tbody').find_all('tr'):
                 cols = linha.find_all('td')
                 if len(cols) < 2: continue
                 di = _converter_data(cols[0].get_text(strip=True))
-                if not di: continue
-                # Só inclui datas do mês atual (dia 1 até hoje)
-                if di < data_ini or di > data_fim: continue
+                if not di or di < data_ini or di > data_fim: continue
                 p = _limpar_numero(cols[1].get_text(strip=True))
                 if p and p > 0:
-                    reg = {
-                        'produto_id':   cfg['produto_id'],
-                        'fonte_id':     INVESTING_FONTE_ID,
-                        'regiao_id':    cfg['regiao_id'],
-                        'data_cotacao': di,
-                    }
+                    reg = {'produto_id':cfg['produto_id'],'fonte_id':INVESTING_FONTE_ID,
+                           'regiao_id':cfg['regiao_id'],'data_cotacao':di}
                     reg['preco_usd' if moeda=='USD' else 'preco_brl'] = p
-                    cotacoes.append(reg)
-                    count += 1
-
-            print(f"   ✅ {count} registros ({data_ini} → {data_fim}) — moeda: {moeda}")
-
+                    cotacoes.append(reg); count += 1
+            print(f"   ✅ {count} registros — moeda: {moeda}")
         except Exception as e:
-            print(f"   ⚠️  {cfg['nome']}: {e}")
-            traceback.print_exc()
+            print(f"   ⚠️  {cfg['nome']}: {e}"); traceback.print_exc()
 
     ok, err = upsert_cotacoes(supabase, cotacoes)
-    return {'fonte':'Investing.com','inseridos':ok,'erros':err}
+    return {'fonte':f'Investing ({nome_grupo})','inseridos':ok,'erros':err}
+
+def sincronizar_cafe_milho(supabase, dias=1):
+    return _sincronizar_investing_grupo(supabase, INVESTING_CAFE_MILHO, 'Café + Milho')
+
+def sincronizar_soja_boi(supabase, dias=1):
+    return _sincronizar_investing_grupo(supabase, INVESTING_SOJA_BOI, 'Soja + Boi Gordo')
 
 
-# ── Selenium (somente CEPEA) ──────────────────────────────────
+# ── Selenium (CEPEA) ──────────────────────────────────────────
 
 def _criar_driver():
     try:
@@ -369,11 +347,8 @@ def _criar_driver():
     except Exception as e:
         print(f"   ❌ driver: {e}"); return None
 
-
-# ── CEPEA/ESALQ ───────────────────────────────────────────────
-
 def sincronizar_cepea(supabase, dias=1):
-    print("\n" + "─"*60 + f"\n🌾  CEPEA/ESALQ  [{'dia atual' if dias==1 else f'últimos {dias} dias'}]\n" + "─"*60)
+    print("\n" + "═"*60 + f"\n🌾  CEPEA/ESALQ  [{'dia atual' if dias==1 else f'últimos {dias} dias'}]\n" + "═"*60)
 
     driver = _criar_driver()
     if not driver:
@@ -394,6 +369,7 @@ def sincronizar_cepea(supabase, dias=1):
 
     registros = []
     lim = (datetime.now() - timedelta(days=dias)).date()
+    total_ok = total_err = 0
 
     try:
         from selenium.webdriver.common.by import By
@@ -435,19 +411,23 @@ def sincronizar_cepea(supabase, dias=1):
                     except: continue
                     valores_dia.setdefault(data_iso, []).append(valor)
 
-                count = 0
+                batch = []
                 for data_iso, vals in sorted(valores_dia.items(), reverse=True):
-                    registros.append({
+                    batch.append({
                         'produto_id':   cfg['produto_id'],
                         'fonte_id':     CEPEA_FONTE_ID,
                         'regiao_id':    cfg['regiao_id'],
                         'data_cotacao': data_iso,
                         'preco_brl':    round(sum(vals)/len(vals), 4),
                     })
-                    count += 1
 
-                ultimo = round(list(valores_dia.values())[0][0], 2) if valores_dia else '—'
-                print(f"   ✅ {count} datas — último: {ultimo} BRL")
+                if batch:
+                    ok, err = upsert_cotacoes(supabase, batch)
+                    total_ok += ok; total_err += err
+                    ultimo = batch[0]['preco_brl']
+                    print(f"   ✅ {len(batch)} datas inseridas — último: {ultimo} BRL")
+                else:
+                    print(f"   ⚠️  Nenhum dado encontrado no período")
 
             except Exception as e:
                 print(f"   ⚠️  {cfg['nome']}: {e}")
@@ -455,18 +435,16 @@ def sincronizar_cepea(supabase, dias=1):
     finally:
         driver.quit(); print("\n   🌐 Navegador fechado")
 
-    ok, err = upsert_cotacoes(supabase, registros)
-    return {'fonte':'CEPEA/ESALQ','inseridos':ok,'erros':err}
+    return {'fonte':'CEPEA/ESALQ','inseridos':total_ok,'erros':total_err}
 
 
 # ── Main ─────────────────────────────────────────────────────
 
 FONTES = {
-    'dolar':     sincronizar_dolar,
-    'selic':     sincronizar_selic,
-    'ipca':      sincronizar_ipca,
-    'investing': sincronizar_investing,
-    'cepea':     sincronizar_cepea,
+    'bcb':        sincronizar_bcb,
+    'cafe_milho': sincronizar_cafe_milho,
+    'soja_boi':   sincronizar_soja_boi,
+    'cepea':      sincronizar_cepea,
 }
 
 def main():
@@ -500,13 +478,13 @@ def main():
         ok = r.get('inseridos',0); err = r.get('erros',0)
         tok += ok; terr += err
         st = "✅" if err==0 and not r.get('excecao') else "⚠️ " if ok>0 else "❌"
-        linha = f"  {st}  {r['fonte']:22}  inseridos: {ok:4d}  erros: {err:4d}"
+        linha = f"  {st}  {r['fonte']:28}  inseridos: {ok:4d}  erros: {err:4d}"
         if r.get('aviso'):   linha += f"  [{r['aviso']}]"
         if r.get('excecao'): linha += f"  [EXCEÇÃO]"; ok_geral = False
         if err > 0: ok_geral = False
         print(linha)
     print("─"*60)
-    print(f"  {'TOTAL':24}  inseridos: {tok:4d}  erros: {terr:4d}")
+    print(f"  {'TOTAL':30}  inseridos: {tok:4d}  erros: {terr:4d}")
     print("="*60)
     print("\n🟢  CONCLUÍDO COM SUCESSO\n" if ok_geral else "\n🔴  CONCLUÍDO COM ERROS\n")
     sys.exit(0 if ok_geral else 1)
