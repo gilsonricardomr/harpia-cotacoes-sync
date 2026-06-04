@@ -2,18 +2,15 @@ name: Sincronizar Cotações
 
 on:
   schedule:
-    # 09h15 BRT = 12h15 UTC
+    # 09h15 BRT = 12h15 UTC — BCB + Café/Milho + CEPEA
     - cron: '15 12 * * 1-5'
-    # 16h15 BRT = 19h15 UTC
-    - cron: '15 19 * * 1-5'
+    # 10h17 BRT = 13h17 UTC — Soja + Boi Gordo
+    - cron: '17 13 * * 1-5'
+
   workflow_dispatch:
     inputs:
-      dias:
-        description: 'Dias retroativos a buscar'
-        required: false
-        default: '1'
       fonte:
-        description: 'Fonte específica (dolar/selic/ipca/investing/yahoo/alpha) — deixe vazio para todas'
+        description: 'Fonte: bcb | cafe_milho | soja_boi | cepea (vazio = todas)'
         required: false
         default: ''
 
@@ -35,31 +32,52 @@ jobs:
         with:
           path: ~/.cache/pip
           key: ${{ runner.os }}-pip-${{ hashFiles('requirements.txt') }}
-          restore-keys: |
-            ${{ runner.os }}-pip-
+          restore-keys: ${{ runner.os }}-pip-
 
       - name: Instalar dependências
         run: pip install -r requirements.txt
 
-      - name: Instalar Chrome e ChromeDriver (para Investing.com)
+      - name: Instalar Chrome (para CEPEA via Selenium)
         uses: browser-actions/setup-chrome@v1
         with:
           chrome-version: stable
 
-      - name: Rodar sincronização
+      - name: Determinar fonte pelo horário
+        id: fonte
+        run: |
+          # Se rodou manualmente com fonte específica, usa ela
+          FONTE_INPUT="${{ github.event.inputs.fonte }}"
+          if [ -n "$FONTE_INPUT" ]; then
+            echo "fontes=$FONTE_INPUT" >> $GITHUB_OUTPUT
+            echo "label=$FONTE_INPUT (manual)" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          # Detecta pelo horário UTC atual
+          HORA=$(date -u +%H%M)
+          if [ "$HORA" -ge "1215" ] && [ "$HORA" -lt "1300" ]; then
+            echo "fontes=bcb cafe_milho cepea" >> $GITHUB_OUTPUT
+            echo "label=09h15 BRT (BCB + Café/Milho + CEPEA)" >> $GITHUB_OUTPUT
+          elif [ "$HORA" -ge "1317" ] && [ "$HORA" -lt "1400" ]; then
+            echo "fontes=soja_boi" >> $GITHUB_OUTPUT
+            echo "label=10h17 BRT (Soja + Boi Gordo)" >> $GITHUB_OUTPUT
+          else
+            # Fallback manual: roda tudo
+            echo "fontes=bcb cafe_milho soja_boi cepea" >> $GITHUB_OUTPUT
+            echo "label=todas as fontes" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Rodar sincronização — ${{ steps.fonte.outputs.label }}
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
-          ALPHA_VANTAGE_KEY: ${{ secrets.ALPHA_VANTAGE_KEY }}
         run: |
-          DIAS=${{ github.event.inputs.dias || '1' }}
-          FONTE=${{ github.event.inputs.fonte || '' }}
-          if [ -n "$FONTE" ]; then
-            python sincronizar.py --dias $DIAS --fonte $FONTE
-          else
-            python sincronizar.py --dias $DIAS
-          fi
+          for FONTE in ${{ steps.fonte.outputs.fontes }}; do
+            echo ""
+            echo "▶ Executando fonte: $FONTE"
+            python sincronizar.py --fonte $FONTE
+          done
 
-      - name: Resultado
+      - name: Finalizado
         if: always()
         run: echo "Sincronização finalizada em $(TZ=America/Sao_Paulo date '+%Y-%m-%d %H:%M:%S BRT')"
