@@ -7,7 +7,7 @@ Fontes:
   1. Dólar BCB          → mercado_indicadores
   2. SELIC BCB          → mercado_indicadores
   3. IPCA BCB           → mercado_indicadores
-  4. Investing.com      → mercado_cotacoes  (Selenium)
+  4. Investing.com      → mercado_cotacoes  (curl_cffi — bypassa Cloudflare)
   5. CEPEA/ESALQ        → mercado_cotacoes  (Selenium) — feijão, arroz
 """
 
@@ -150,32 +150,7 @@ def sincronizar_ipca(supabase, dias=1):
         return {'fonte':'IPCA BCB','inseridos':0,'erros':1,'excecao':str(e)}
 
 
-# ── Selenium ──────────────────────────────────────────────────
-
-def _criar_driver():
-    try:
-        from selenium import webdriver
-        from selenium.webdriver.chrome.options import Options
-        from selenium.webdriver.chrome.service import Service
-        from webdriver_manager.chrome import ChromeDriverManager
-
-        opts = Options()
-        for a in ['--headless','--no-sandbox','--disable-dev-shm-usage','--disable-gpu',
-                  '--window-size=1920,1080','--lang=pt-BR','--disable-blink-features=AutomationControlled']:
-            opts.add_argument(a)
-        opts.add_argument('user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
-                          'AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36')
-
-        for path in CHROME_BINARY_PATHS:
-            if os.path.exists(path):
-                opts.binary_location = path
-                print(f"   🌐 Chrome: {path}")
-                break
-
-        service = Service(ChromeDriverManager().install())
-        return webdriver.Chrome(service=service, options=opts)
-    except Exception as e:
-        print(f"   ❌ driver: {e}"); return None
+# ── Helpers de parsing ────────────────────────────────────────
 
 def _limpar_numero(t):
     if not t: return None
@@ -214,126 +189,165 @@ def _detectar_moeda(soup):
         return e.get_text(strip=True).upper()
     return 'BRL'
 
-def _extrair_preco_investing(soup):
-    """
-    Tenta múltiplos seletores para extrair o preço do Investing.com.
-    O site muda a estrutura com frequência.
-    """
+
+# ── Investing.com (curl_cffi — bypassa Cloudflare) ────────────
+#
+# curl_cffi emula o fingerprint TLS do Chrome real.
+# Funciona em IPs de datacenter (GitHub Actions, VPS) onde
+# o Selenium headless é bloqueado pelo Cloudflare.
+
+def _fetch_investing(url: str, tentativas: int = 3) -> BeautifulSoup | None:
+    """Faz o request ao Investing.com com curl_cffi, retorna BeautifulSoup ou None."""
+    try:
+        from curl_cffi import requests as cf
+    except ImportError:
+        print("   ❌ curl_cffi não instalado (pip install curl_cffi)")
+        return None
+
+    for i in range(tentativas):
+        try:
+            resp = cf.get(
+                url,
+                impersonate="chrome120",
+                timeout=30,
+                headers={
+                    'Accept-Language': 'pt-BR,pt;q=0.9,en;q=0.8',
+                    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+                    'Referer': 'https://br.investing.com/',
+                }
+            )
+            if resp.status_code == 200:
+                titulo = BeautifulSoup(resp.text,'html.parser').find('title')
+                titulo_txt = titulo.text.strip() if titulo else ''
+                if 'Just a moment' in titulo_txt or 'Attention Required' in titulo_txt:
+                    print(f"   ⚠️  Cloudflare ainda ativo (tentativa {i+1}/{tentativas})")
+                    time.sleep(5)
+                    continue
+                return BeautifulSoup(resp.text, 'html.parser')
+            else:
+                print(f"   ⚠️  HTTP {resp.status_code} (tentativa {i+1}/{tentativas})")
+                time.sleep(3)
+        except Exception as e:
+            print(f"   ⚠️  Erro na requisição (tentativa {i+1}/{tentativas}): {e}")
+            time.sleep(3)
+    return None
+
+def _extrair_preco_investing(soup) -> str | None:
+    """Extrai o preço atual de uma página do Investing.com."""
     seletores = [
-        # Seletores modernos
         lambda s: s.find(attrs={'data-test': 'instrument-price-last'}),
         lambda s: s.find('div', attrs={'data-test': 'instrument-price-last'}),
-        # Seletores por classe
         lambda s: s.find(class_=re.compile(r'text-5xl|last-price|instrument-price')),
         lambda s: s.find('span', class_=re.compile(r'text-\[|priceText')),
-        # Seletores legados
         lambda s: s.find(id='last_last'),
         lambda s: s.find('span', id=re.compile(r'last')),
-        # Qualquer número grande em destaque (heurística)
-        lambda s: next((e for e in s.find_all(['span','div'])
-                        if e.get('class') and any('text-' in c for c in e.get('class',[]))
-                        and re.match(r'^[\d,.]+$', e.get_text(strip=True))), None),
     ]
     for fn in seletores:
         try:
             e = fn(soup)
             if e:
                 txt = e.get_text(strip=True)
-                v = _limpar_numero(txt)
-                if v and v > 0:
-                    return txt
+                if _limpar_numero(txt): return txt
         except: continue
     return None
 
 
-# ── Investing.com ─────────────────────────────────────────────
-
 def sincronizar_investing(supabase, dias=1):
     print("\n" + "─"*60 + f"\n📈  INVESTING.COM  [{'dia atual' if dias==1 else f'últimos {dias} dias'}]\n" + "─"*60)
-    try:
-        from selenium.webdriver.common.by import By
-        from selenium.webdriver.support.ui import WebDriverWait
-        from selenium.webdriver.support import expected_conditions as EC
-    except ImportError:
-        return {'fonte':'Investing.com','inseridos':0,'erros':0,'aviso':'Selenium não instalado'}
-
-    driver = _criar_driver()
-    if not driver:
-        return {'fonte':'Investing.com','inseridos':0,'erros':0,'aviso':'Falha no driver'}
 
     cotacoes = []
-    try:
-        for cfg in SCRAPING_CONFIG:
-            print(f"\n   📊 {cfg['nome']}")
-            try:
-                if dias == 1:
-                    driver.get(cfg['url_atual'])
-                    # Aguarda qualquer sinal de preço na página
-                    try:
-                        WebDriverWait(driver,20).until(
-                            EC.any_of(
-                                EC.presence_of_element_located((By.CSS_SELECTOR,'[data-test="instrument-price-last"]')),
-                                EC.presence_of_element_located((By.ID,'last_last')),
-                                EC.presence_of_element_located((By.CSS_SELECTOR,'.text-5xl')),
-                            ))
-                    except: time.sleep(8)
 
-                    soup  = BeautifulSoup(driver.page_source,'html.parser')
-                    moeda = _detectar_moeda(soup)
-                    ps    = _extrair_preco_investing(soup)
+    for cfg in SCRAPING_CONFIG:
+        print(f"\n   📊 {cfg['nome']}")
+        try:
+            if dias == 1:
+                soup = _fetch_investing(cfg['url_atual'])
+                if not soup:
+                    print(f"   ❌ Falha ao obter página"); continue
 
-                    if ps:
-                        p = _limpar_numero(ps)
+                moeda = _detectar_moeda(soup)
+                ps    = _extrair_preco_investing(soup)
+
+                if ps:
+                    p = _limpar_numero(ps)
+                    if p and p > 0:
+                        reg = {'produto_id':cfg['produto_id'],'fonte_id':INVESTING_FONTE_ID,
+                               'regiao_id':cfg['regiao_id'],'data_cotacao':datetime.now().strftime('%Y-%m-%d')}
+                        reg['preco_usd' if moeda=='USD' else 'preco_brl'] = p
+                        cotacoes.append(reg)
+                        print(f"   ✅ {p} {moeda}")
+                    else:
+                        print(f"   ⚠️  Preço inválido: {ps}")
+                else:
+                    titulo = soup.find('title')
+                    print(f"   ⚠️  Preço não encontrado — título: {titulo.text.strip() if titulo else '?'}")
+
+            else:
+                soup = _fetch_investing(cfg['url_historico'])
+                if not soup:
+                    print(f"   ❌ Falha ao obter página histórica"); continue
+
+                moeda = _detectar_moeda(soup)
+                tab = None
+                for c in [soup.find('table',{'id':re.compile(r'curr_table|historicalTbl',re.I)}),
+                           soup.find('table',class_=re.compile(r'freeze-column-w-1|historical',re.I))]:
+                    if c and c.find('tbody'): tab=c; break
+                if not tab:
+                    for t in soup.find_all('table'):
+                        if t.find('tbody') and len(t.find('tbody').find_all('tr'))>5: tab=t; break
+
+                if tab:
+                    lim = datetime.now()-timedelta(days=dias)
+                    count = 0
+                    for linha in tab.find('tbody').find_all('tr'):
+                        cols = linha.find_all('td')
+                        if len(cols)<2: continue
+                        di = _converter_data(cols[0].get_text(strip=True))
+                        if not di or datetime.strptime(di,'%Y-%m-%d')<lim: break
+                        p = _limpar_numero(cols[1].get_text(strip=True))
                         if p and p > 0:
                             reg = {'produto_id':cfg['produto_id'],'fonte_id':INVESTING_FONTE_ID,
-                                   'regiao_id':cfg['regiao_id'],'data_cotacao':datetime.now().strftime('%Y-%m-%d')}
+                                   'regiao_id':cfg['regiao_id'],'data_cotacao':di}
                             reg['preco_usd' if moeda=='USD' else 'preco_brl'] = p
-                            cotacoes.append(reg)
-                            print(f"   ✅ {p} {moeda}")
-                        else:
-                            print(f"   ⚠️  Preço inválido: {ps}")
-                    else:
-                        # Debug: mostra título da página para detectar bloqueio Cloudflare
-                        titulo = soup.find('title')
-                        print(f"   ⚠️  Preço não encontrado — título: {titulo.text if titulo else 'sem título'}")
+                            cotacoes.append(reg); count += 1
+                    print(f"   ✅ {count} registros históricos")
                 else:
-                    driver.get(cfg['url_historico'])
-                    try: WebDriverWait(driver,20).until(EC.presence_of_element_located((By.CSS_SELECTOR,'table tbody tr td')))
-                    except: time.sleep(10)
-                    soup  = BeautifulSoup(driver.page_source,'html.parser')
-                    moeda = _detectar_moeda(soup)
-                    tab = None
-                    for c in [soup.find('table',{'id':re.compile(r'curr_table|historicalTbl',re.I)}),
-                               soup.find('table',class_=re.compile(r'freeze-column-w-1|historical',re.I))]:
-                        if c and c.find('tbody'): tab=c; break
-                    if not tab:
-                        for t in soup.find_all('table'):
-                            if t.find('tbody') and len(t.find('tbody').find_all('tr'))>5: tab=t; break
-                    if tab:
-                        lim = datetime.now()-timedelta(days=dias)
-                        count = 0
-                        for linha in tab.find('tbody').find_all('tr'):
-                            cols = linha.find_all('td')
-                            if len(cols)<2: continue
-                            di = _converter_data(cols[0].get_text(strip=True))
-                            if not di or datetime.strptime(di,'%Y-%m-%d')<lim: break
-                            p = _limpar_numero(cols[1].get_text(strip=True))
-                            if p and p > 0:
-                                reg = {'produto_id':cfg['produto_id'],'fonte_id':INVESTING_FONTE_ID,
-                                       'regiao_id':cfg['regiao_id'],'data_cotacao':di}
-                                reg['preco_usd' if moeda=='USD' else 'preco_brl'] = p
-                                cotacoes.append(reg); count += 1
-                        print(f"   ✅ {count} registros históricos")
-                    else:
-                        print(f"   ⚠️  Tabela histórica não encontrada")
-            except Exception as e:
-                print(f"   ⚠️  {cfg['nome']}: {e}")
-            time.sleep(3)
-    finally:
-        driver.quit(); print("\n   🌐 Navegador fechado")
+                    print(f"   ⚠️  Tabela histórica não encontrada")
+
+        except Exception as e:
+            print(f"   ⚠️  {cfg['nome']}: {e}")
+        time.sleep(2)
 
     ok, err = upsert_cotacoes(supabase, cotacoes)
     return {'fonte':'Investing.com','inseridos':ok,'erros':err}
+
+
+# ── Selenium (somente CEPEA) ──────────────────────────────────
+
+def _criar_driver():
+    try:
+        from selenium import webdriver
+        from selenium.webdriver.chrome.options import Options
+        from selenium.webdriver.chrome.service import Service
+        from webdriver_manager.chrome import ChromeDriverManager
+
+        opts = Options()
+        for a in ['--headless','--no-sandbox','--disable-dev-shm-usage','--disable-gpu',
+                  '--window-size=1920,1080','--lang=pt-BR','--disable-blink-features=AutomationControlled']:
+            opts.add_argument(a)
+        opts.add_argument('user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
+                          'AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36')
+
+        for path in CHROME_BINARY_PATHS:
+            if os.path.exists(path):
+                opts.binary_location = path
+                print(f"   🌐 Chrome: {path}")
+                break
+
+        service = Service(ChromeDriverManager().install())
+        return webdriver.Chrome(service=service, options=opts)
+    except Exception as e:
+        print(f"   ❌ driver: {e}"); return None
 
 
 # ── CEPEA/ESALQ ───────────────────────────────────────────────
@@ -370,16 +384,13 @@ def sincronizar_cepea(supabase, dias=1):
             print(f"\n   📊 {cfg['nome']}")
             try:
                 driver.get(cfg['url'])
-
-                # Usa o seletor CSS específico de cada produto para aguardar a tabela
                 wait_css = cfg.get('wait_css', 'table tbody tr td')
                 try:
                     WebDriverWait(driver, 20).until(
-                        EC.presence_of_element_located((By.CSS_SELECTOR, wait_css))
-                    )
-                    print(f"   ✅ Tabela carregada ({wait_css})")
+                        EC.presence_of_element_located((By.CSS_SELECTOR, wait_css)))
+                    print(f"   ✅ Tabela carregada")
                 except Exception:
-                    print(f"   ⚠️  Timeout aguardando '{wait_css}' — tentando mesmo assim")
+                    print(f"   ⚠️  Timeout aguardando tabela — tentando mesmo assim")
 
                 soup    = BeautifulSoup(driver.page_source, 'html.parser')
                 tabelas = soup.find_all('table')
