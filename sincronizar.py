@@ -7,12 +7,19 @@ Fontes:
   1. Dólar BCB          → mercado_indicadores
   2. SELIC BCB          → mercado_indicadores
   3. IPCA BCB           → mercado_indicadores
-  4. Investing.com      → mercado_cotacoes  (curl_cffi — bypassa Cloudflare)
+  4. Investing.com      → mercado_cotacoes  (curl_cffi, dados históricos do mês atual)
   5. CEPEA/ESALQ        → mercado_cotacoes  (Selenium) — feijão, arroz
+
+Estratégia Investing.com:
+  - Sempre usa a URL histórica (mais estável que a página atual)
+  - Busca do dia 1 do mês atual até hoje
+  - Antes de inserir: zera preco_brl e preco_usd dos registros do período
+    para forçar o trigger a recalcular a conversão com o dólar mais recente
+  - O campo --dias é ignorado para o Investing (sempre usa mês atual)
 """
 
 import os, sys, re, time, argparse, traceback
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, date
 
 _env_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), '.env')
 if os.path.exists(_env_path):
@@ -44,11 +51,9 @@ CHROME_BINARY_PATHS = [
     '/usr/bin/chromium',
 ]
 
-# ── Tempos de espera para o Investing.com ─────────────────────
-# Entre tentativas 403: 30s (3x o valor anterior de 10s)
-# Entre produtos:       24s (3x o valor anterior de 8s)
-INVESTING_SLEEP_RETRY   = 30
-INVESTING_SLEEP_PRODUTO = 24
+# Tempos de espera Investing.com
+INVESTING_SLEEP_RETRY   = 30  # entre tentativas 403
+INVESTING_SLEEP_PRODUTO = 24  # entre produtos
 
 
 def conectar_supabase():
@@ -73,6 +78,31 @@ def upsert_indicadores(supabase, registros):
         return len(registros), 0
     except Exception as e:
         print(f"   ❌ Erro indicadores: {e}"); return 0, len(registros)
+
+def limpar_precos_cotacoes(supabase, produto_id: str, fonte_id: str, regiao_id: str,
+                            data_inicio: str, data_fim: str) -> int:
+    """
+    Zera preco_brl e preco_usd dos registros do período antes do upsert.
+    Isso força o trigger calcular_preco_convertido a recalcular a conversão
+    com o dólar mais recente quando o novo valor for inserido.
+    Retorna o número de registros zerados.
+    """
+    try:
+        resp = (supabase.table('mercado_cotacoes')
+            .update({'preco_brl': None, 'preco_usd': None})
+            .eq('produto_id', produto_id)
+            .eq('fonte_id', fonte_id)
+            .eq('regiao_id', regiao_id)
+            .gte('data_cotacao', data_inicio)
+            .lte('data_cotacao', data_fim)
+            .execute())
+        n = len(resp.data) if resp.data else 0
+        if n > 0:
+            print(f"   🔄 {n} registros zerados (aguarda recálculo pelo trigger)")
+        return n
+    except Exception as e:
+        print(f"   ⚠️  Erro ao zerar preços: {e}")
+        return 0
 
 
 # ── BCB ──────────────────────────────────────────────────────
@@ -196,7 +226,7 @@ def _detectar_moeda(soup):
     return 'BRL'
 
 
-# ── Investing.com (curl_cffi) ─────────────────────────────────
+# ── Investing.com (curl_cffi + histórico do mês) ──────────────
 
 def _fetch_investing(url: str, tentativas: int = 3) -> BeautifulSoup | None:
     try:
@@ -232,27 +262,15 @@ def _fetch_investing(url: str, tentativas: int = 3) -> BeautifulSoup | None:
             time.sleep(INVESTING_SLEEP_RETRY)
     return None
 
-def _extrair_preco_investing(soup) -> str | None:
-    seletores = [
-        lambda s: s.find(attrs={'data-test': 'instrument-price-last'}),
-        lambda s: s.find('div', attrs={'data-test': 'instrument-price-last'}),
-        lambda s: s.find(class_=re.compile(r'text-5xl|last-price|instrument-price')),
-        lambda s: s.find('span', class_=re.compile(r'text-\[|priceText')),
-        lambda s: s.find(id='last_last'),
-        lambda s: s.find('span', id=re.compile(r'last')),
-    ]
-    for fn in seletores:
-        try:
-            e = fn(soup)
-            if e:
-                txt = e.get_text(strip=True)
-                if _limpar_numero(txt): return txt
-        except: continue
-    return None
-
 
 def sincronizar_investing(supabase, dias=1):
-    print("\n" + "─"*60 + f"\n📈  INVESTING.COM  [{'dia atual' if dias==1 else f'últimos {dias} dias'}]\n" + "─"*60)
+    # dias ignorado — sempre busca do dia 1 do mês atual até hoje
+    hoje       = date.today()
+    data_ini   = hoje.replace(day=1).isoformat()   # ex: 2026-06-01
+    data_fim   = hoje.isoformat()                  # ex: 2026-06-04
+
+    print("\n" + "─"*60 +
+          f"\n📈  INVESTING.COM  [histórico: {data_ini} → {data_fim}]\n" + "─"*60)
     print(f"   ⏱️  Sleep entre produtos: {INVESTING_SLEEP_PRODUTO}s | entre tentativas: {INVESTING_SLEEP_RETRY}s")
 
     cotacoes = []
@@ -260,65 +278,65 @@ def sincronizar_investing(supabase, dias=1):
     for idx, cfg in enumerate(SCRAPING_CONFIG):
         print(f"\n   📊 {cfg['nome']}")
         if idx > 0:
-            print(f"   ⏳ Aguardando {INVESTING_SLEEP_PRODUTO}s antes do próximo produto...")
+            print(f"   ⏳ Aguardando {INVESTING_SLEEP_PRODUTO}s...")
             time.sleep(INVESTING_SLEEP_PRODUTO)
         try:
-            if dias == 1:
-                soup = _fetch_investing(cfg['url_atual'])
-                if not soup:
-                    print(f"   ❌ Falha ao obter página"); continue
+            soup = _fetch_investing(cfg['url_historico'])
+            if not soup:
+                print(f"   ❌ Falha ao obter página histórica"); continue
 
-                moeda = _detectar_moeda(soup)
-                ps    = _extrair_preco_investing(soup)
+            moeda = _detectar_moeda(soup)
 
-                if ps:
-                    p = _limpar_numero(ps)
-                    if p and p > 0:
-                        reg = {'produto_id':cfg['produto_id'],'fonte_id':INVESTING_FONTE_ID,
-                               'regiao_id':cfg['regiao_id'],'data_cotacao':datetime.now().strftime('%Y-%m-%d')}
-                        reg['preco_usd' if moeda=='USD' else 'preco_brl'] = p
-                        cotacoes.append(reg)
-                        print(f"   ✅ {p} {moeda}")
-                    else:
-                        print(f"   ⚠️  Preço inválido: {ps}")
-                else:
-                    titulo = soup.find('title')
-                    print(f"   ⚠️  Preço não encontrado — título: {titulo.text.strip() if titulo else '?'}")
+            # Encontra a tabela histórica
+            tab = None
+            for c in [soup.find('table',{'id':re.compile(r'curr_table|historicalTbl',re.I)}),
+                       soup.find('table',class_=re.compile(r'freeze-column-w-1|historical',re.I))]:
+                if c and c.find('tbody'): tab=c; break
+            if not tab:
+                for t in soup.find_all('table'):
+                    if t.find('tbody') and len(t.find('tbody').find_all('tr')) > 3:
+                        tab=t; break
 
-            else:
-                soup = _fetch_investing(cfg['url_historico'])
-                if not soup:
-                    print(f"   ❌ Falha ao obter página histórica"); continue
+            if not tab:
+                print(f"   ⚠️  Tabela histórica não encontrada"); continue
 
-                moeda = _detectar_moeda(soup)
-                tab = None
-                for c in [soup.find('table',{'id':re.compile(r'curr_table|historicalTbl',re.I)}),
-                           soup.find('table',class_=re.compile(r'freeze-column-w-1|historical',re.I))]:
-                    if c and c.find('tbody'): tab=c; break
-                if not tab:
-                    for t in soup.find_all('table'):
-                        if t.find('tbody') and len(t.find('tbody').find_all('tr'))>5: tab=t; break
+            # Zera preços do período antes de inserir
+            # (força trigger a recalcular conversão com dólar atual)
+            limpar_precos_cotacoes(
+                supabase,
+                produto_id  = cfg['produto_id'],
+                fonte_id    = INVESTING_FONTE_ID,
+                regiao_id   = cfg['regiao_id'],
+                data_inicio = data_ini,
+                data_fim    = data_fim,
+            )
 
-                if tab:
-                    lim = datetime.now()-timedelta(days=dias)
-                    count = 0
-                    for linha in tab.find('tbody').find_all('tr'):
-                        cols = linha.find_all('td')
-                        if len(cols)<2: continue
-                        di = _converter_data(cols[0].get_text(strip=True))
-                        if not di or datetime.strptime(di,'%Y-%m-%d')<lim: break
-                        p = _limpar_numero(cols[1].get_text(strip=True))
-                        if p and p > 0:
-                            reg = {'produto_id':cfg['produto_id'],'fonte_id':INVESTING_FONTE_ID,
-                                   'regiao_id':cfg['regiao_id'],'data_cotacao':di}
-                            reg['preco_usd' if moeda=='USD' else 'preco_brl'] = p
-                            cotacoes.append(reg); count += 1
-                    print(f"   ✅ {count} registros históricos")
-                else:
-                    print(f"   ⚠️  Tabela histórica não encontrada")
+            # Parseia linhas da tabela filtrando pelo mês atual
+            count = 0
+            for linha in tab.find('tbody').find_all('tr'):
+                cols = linha.find_all('td')
+                if len(cols) < 2: continue
+                di = _converter_data(cols[0].get_text(strip=True))
+                if not di: continue
+                # Só inclui datas do mês atual (dia 1 até hoje)
+                if di < data_ini or di > data_fim: continue
+                p = _limpar_numero(cols[1].get_text(strip=True))
+                if p and p > 0:
+                    reg = {
+                        'produto_id':   cfg['produto_id'],
+                        'fonte_id':     INVESTING_FONTE_ID,
+                        'regiao_id':    cfg['regiao_id'],
+                        'data_cotacao': di,
+                    }
+                    reg['preco_usd' if moeda=='USD' else 'preco_brl'] = p
+                    cotacoes.append(reg)
+                    count += 1
+
+            print(f"   ✅ {count} registros ({data_ini} → {data_fim}) — moeda: {moeda}")
 
         except Exception as e:
             print(f"   ⚠️  {cfg['nome']}: {e}")
+            traceback.print_exc()
 
     ok, err = upsert_cotacoes(supabase, cotacoes)
     return {'fonte':'Investing.com','inseridos':ok,'erros':err}
