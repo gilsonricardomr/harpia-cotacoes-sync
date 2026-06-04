@@ -9,13 +9,6 @@ Fontes:
   3. IPCA BCB           → mercado_indicadores
   4. Investing.com      → mercado_cotacoes  (Selenium)
   5. CEPEA/ESALQ        → mercado_cotacoes  (Selenium) — feijão, arroz
-
-Uso:
-  python sincronizar.py              → dia atual, todas as fontes
-  python sincronizar.py --dias 7    → últimos 7 dias
-  python sincronizar.py --fonte dolar
-  python sincronizar.py --fonte investing
-  python sincronizar.py --fonte cepea
 """
 
 import os, sys, re, time, argparse, traceback
@@ -44,10 +37,8 @@ IPCA_PRODUTO_ID  = '81719845-bca4-44ff-838d-11411c9136ed'
 SUPABASE_URL = os.environ.get('SUPABASE_URL')
 SUPABASE_KEY = os.environ.get('SUPABASE_KEY')
 
-# Caminho do Chrome instalado pelo browser-actions/setup-chrome no GitHub Actions
-# Em ambiente local (Mac/Windows) o webdriver-manager resolve automaticamente
 CHROME_BINARY_PATHS = [
-    '/opt/hostedtoolcache/setup-chrome/chromium/stable/x64/chrome',  # GitHub Actions
+    '/opt/hostedtoolcache/setup-chrome/chromium/stable/x64/chrome',
     '/usr/bin/google-chrome',
     '/usr/bin/chromium-browser',
     '/usr/bin/chromium',
@@ -160,8 +151,6 @@ def sincronizar_ipca(supabase, dias=1):
 
 
 # ── Selenium ──────────────────────────────────────────────────
-# Corrige o problema de timeout no GitHub Actions apontando
-# explicitamente para o binário instalado pelo setup-chrome.
 
 def _criar_driver():
     try:
@@ -177,17 +166,14 @@ def _criar_driver():
         opts.add_argument('user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
                           'AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36')
 
-        # Tenta usar o Chrome do setup-chrome (GitHub Actions)
         for path in CHROME_BINARY_PATHS:
             if os.path.exists(path):
                 opts.binary_location = path
                 print(f"   🌐 Chrome: {path}")
                 break
 
-        # webdriver-manager instala o ChromeDriver compatível automaticamente
         service = Service(ChromeDriverManager().install())
         return webdriver.Chrome(service=service, options=opts)
-
     except Exception as e:
         print(f"   ❌ driver: {e}"); return None
 
@@ -228,6 +214,37 @@ def _detectar_moeda(soup):
         return e.get_text(strip=True).upper()
     return 'BRL'
 
+def _extrair_preco_investing(soup):
+    """
+    Tenta múltiplos seletores para extrair o preço do Investing.com.
+    O site muda a estrutura com frequência.
+    """
+    seletores = [
+        # Seletores modernos
+        lambda s: s.find(attrs={'data-test': 'instrument-price-last'}),
+        lambda s: s.find('div', attrs={'data-test': 'instrument-price-last'}),
+        # Seletores por classe
+        lambda s: s.find(class_=re.compile(r'text-5xl|last-price|instrument-price')),
+        lambda s: s.find('span', class_=re.compile(r'text-\[|priceText')),
+        # Seletores legados
+        lambda s: s.find(id='last_last'),
+        lambda s: s.find('span', id=re.compile(r'last')),
+        # Qualquer número grande em destaque (heurística)
+        lambda s: next((e for e in s.find_all(['span','div'])
+                        if e.get('class') and any('text-' in c for c in e.get('class',[]))
+                        and re.match(r'^[\d,.]+$', e.get_text(strip=True))), None),
+    ]
+    for fn in seletores:
+        try:
+            e = fn(soup)
+            if e:
+                txt = e.get_text(strip=True)
+                v = _limpar_numero(txt)
+                if v and v > 0:
+                    return txt
+        except: continue
+    return None
+
 
 # ── Investing.com ─────────────────────────────────────────────
 
@@ -251,16 +268,20 @@ def sincronizar_investing(supabase, dias=1):
             try:
                 if dias == 1:
                     driver.get(cfg['url_atual'])
-                    try: WebDriverWait(driver,20).until(EC.presence_of_element_located((By.CSS_SELECTOR,'[data-test="instrument-price-last"]')))
+                    # Aguarda qualquer sinal de preço na página
+                    try:
+                        WebDriverWait(driver,20).until(
+                            EC.any_of(
+                                EC.presence_of_element_located((By.CSS_SELECTOR,'[data-test="instrument-price-last"]')),
+                                EC.presence_of_element_located((By.ID,'last_last')),
+                                EC.presence_of_element_located((By.CSS_SELECTOR,'.text-5xl')),
+                            ))
                     except: time.sleep(8)
+
                     soup  = BeautifulSoup(driver.page_source,'html.parser')
                     moeda = _detectar_moeda(soup)
-                    ps = None
-                    for fn in [lambda s:s.find(attrs={'data-test':'instrument-price-last'}),
-                               lambda s:s.find(id='last_last'),
-                               lambda s:s.find('span',class_=re.compile(r'text-5xl'))]:
-                        e = fn(soup)
-                        if e: ps = e.get_text(strip=True); break
+                    ps    = _extrair_preco_investing(soup)
+
                     if ps:
                         p = _limpar_numero(ps)
                         if p and p > 0:
@@ -272,7 +293,9 @@ def sincronizar_investing(supabase, dias=1):
                         else:
                             print(f"   ⚠️  Preço inválido: {ps}")
                     else:
-                        print(f"   ⚠️  Preço não encontrado na página")
+                        # Debug: mostra título da página para detectar bloqueio Cloudflare
+                        titulo = soup.find('title')
+                        print(f"   ⚠️  Preço não encontrado — título: {titulo.text if titulo else 'sem título'}")
                 else:
                     driver.get(cfg['url_historico'])
                     try: WebDriverWait(driver,20).until(EC.presence_of_element_located((By.CSS_SELECTOR,'table tbody tr td')))
@@ -314,8 +337,6 @@ def sincronizar_investing(supabase, dias=1):
 
 
 # ── CEPEA/ESALQ ───────────────────────────────────────────────
-# Usa Selenium para contornar o bloqueio 403 do servidor.
-# WebDriverWait aguarda a tabela renderizar (JS) antes de parsear.
 
 def sincronizar_cepea(supabase, dias=1):
     print("\n" + "─"*60 + f"\n🌾  CEPEA/ESALQ  [{'dia atual' if dias==1 else f'últimos {dias} dias'}]\n" + "─"*60)
@@ -350,13 +371,15 @@ def sincronizar_cepea(supabase, dias=1):
             try:
                 driver.get(cfg['url'])
 
-                # Aguarda a tabela renderizar (máx 15s)
+                # Usa o seletor CSS específico de cada produto para aguardar a tabela
+                wait_css = cfg.get('wait_css', 'table tbody tr td')
                 try:
-                    WebDriverWait(driver, 15).until(
-                        EC.presence_of_element_located((By.CSS_SELECTOR, 'table tbody tr td'))
+                    WebDriverWait(driver, 20).until(
+                        EC.presence_of_element_located((By.CSS_SELECTOR, wait_css))
                     )
+                    print(f"   ✅ Tabela carregada ({wait_css})")
                 except Exception:
-                    print(f"   ⚠️  Timeout aguardando tabela — tentando mesmo assim")
+                    print(f"   ⚠️  Timeout aguardando '{wait_css}' — tentando mesmo assim")
 
                 soup    = BeautifulSoup(driver.page_source, 'html.parser')
                 tabelas = soup.find_all('table')
