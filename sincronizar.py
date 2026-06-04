@@ -8,27 +8,15 @@ Fontes:
   2. SELIC BCB          → mercado_indicadores  (série 432)
   3. IPCA BCB           → mercado_indicadores  (série 13522)
   4. Investing.com      → mercado_cotacoes     (Selenium)
-  5. Yahoo Finance      → mercado_cotacoes     (yfinance)
+  5. Yahoo Finance      → mercado_cotacoes     (yfinance) — soja, milho, café, trigo, boi gordo
   6. Alpha Vantage      → mercado_cotacoes     (API REST)
+  7. CEPEA/ESALQ        → mercado_cotacoes     (scraping HTML) — feijão, arroz
 
 Todas as fontes rodam de forma independente.
 Uma falha em qualquer fonte não interrompe as demais.
-
-Uso:
-  python sincronizar.py              → apenas o dia atual
-  python sincronizar.py --dias 7    → últimos 7 dias
-  python sincronizar.py --fonte dolar
-  python sincronizar.py --fonte investing
-  python sincronizar.py --fonte yahoo
-  python sincronizar.py --fonte alpha
 """
 
-import os
-import sys
-import re
-import time
-import argparse
-import traceback
+import os, sys, re, time, argparse, traceback
 from datetime import datetime, timedelta
 
 _env_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), '.env')
@@ -45,23 +33,16 @@ from bs4 import BeautifulSoup
 from supabase import create_client, Client
 
 from config_investing import FONTE_ID as INVESTING_FONTE_ID, SCRAPING_CONFIG
-from config_yahoo import FONTE_ID as YAHOO_FONTE_ID, YAHOO_CONFIG
-from config_alpha import FONTE_ID as ALPHA_FONTE_ID, ALPHA_CONFIG, BASE_URL as ALPHA_BASE_URL
-
-# ============================================================
-# CONSTANTES BCB
-# ============================================================
+from config_yahoo    import FONTE_ID as YAHOO_FONTE_ID,    YAHOO_CONFIG
+from config_alpha    import FONTE_ID as ALPHA_FONTE_ID,    ALPHA_CONFIG, BASE_URL as ALPHA_BASE_URL
+from config_cepea    import FONTE_ID as CEPEA_FONTE_ID,    CEPEA_CONFIG
 
 BCB_FONTE_ID     = 'f64f3c6e-9bdd-4e82-a158-983733760d9a'
 SELIC_PRODUTO_ID = '02ce74c6-280d-421f-ab05-9a04fd729692'
 IPCA_PRODUTO_ID  = '81719845-bca4-44ff-838d-11411c9136ed'
 
-# ============================================================
-# SUPABASE
-# ============================================================
-
-SUPABASE_URL = os.environ.get('SUPABASE_URL')
-SUPABASE_KEY = os.environ.get('SUPABASE_KEY')
+SUPABASE_URL      = os.environ.get('SUPABASE_URL')
+SUPABASE_KEY      = os.environ.get('SUPABASE_KEY')
 ALPHA_VANTAGE_KEY = os.environ.get('ALPHA_VANTAGE_KEY')
 
 
@@ -70,536 +51,445 @@ def conectar_supabase() -> Client:
         raise EnvironmentError("Configure SUPABASE_URL e SUPABASE_KEY")
     return create_client(SUPABASE_URL, SUPABASE_KEY)
 
-
-def upsert_cotacoes(supabase: Client, registros: list) -> tuple:
-    if not registros:
-        return 0, 0
+def upsert_cotacoes(supabase, registros):
+    if not registros: return 0, 0
     try:
         supabase.table('mercado_cotacoes').upsert(
-            registros, on_conflict='produto_id,data_cotacao,fonte_id,regiao_id'
-        ).execute()
+            registros, on_conflict='produto_id,data_cotacao,fonte_id,regiao_id').execute()
         return len(registros), 0
     except Exception as e:
         print(f"   ❌ Erro ao inserir cotações: {e}")
         return 0, len(registros)
 
-
-def upsert_indicadores(supabase: Client, registros: list) -> tuple:
-    if not registros:
-        return 0, 0
+def upsert_indicadores(supabase, registros):
+    if not registros: return 0, 0
     try:
         supabase.table('mercado_indicadores').upsert(
-            registros, on_conflict='produto_id,data_cotacao,fonte_id'
-        ).execute()
+            registros, on_conflict='produto_id,data_cotacao,fonte_id').execute()
         return len(registros), 0
     except Exception as e:
         print(f"   ❌ Erro ao inserir indicadores: {e}")
         return 0, len(registros)
 
 
-# ============================================================
-# FONTE 1 — DÓLAR (BCB)
-# ============================================================
+# ── BCB ──────────────────────────────────────────────────────
 
-def _obter_produto_dolar_id(supabase: Client) -> str:
-    response = supabase.table('mercado_produtos') \
-        .select('id, nome') \
-        .or_('nome.ilike.%dólar%,nome.ilike.%dolar%,nome.ilike.%USD%') \
-        .limit(1).execute()
-    if not response.data:
-        raise Exception("Produto Dólar não encontrado em mercado_produtos!")
-    prod = response.data[0]
-    print(f"   ✅ Produto: {prod['nome']} ({prod['id']})")
-    return prod['id']
-
-
-def sincronizar_dolar(supabase: Client, dias: int = 1) -> dict:
-    print("\n" + "─" * 60)
-    print("💵  DÓLAR (BCB)")
-    print("─" * 60)
+def sincronizar_dolar(supabase, dias=1):
+    print("\n" + "─"*60 + "\n💵  DÓLAR (BCB)\n" + "─"*60)
     try:
-        produto_id = _obter_produto_dolar_id(supabase)
+        r = supabase.table('mercado_produtos').select('id,nome') \
+            .or_('nome.ilike.%dólar%,nome.ilike.%dolar%,nome.ilike.%USD%').limit(1).execute()
+        if not r.data: raise Exception("Produto Dólar não encontrado")
+        prod_id = r.data[0]['id']
+        print(f"   ✅ {r.data[0]['nome']}")
         hoje = datetime.now()
-        data_fim    = hoje.strftime('%m-%d-%Y')
-        data_inicio = (hoje - timedelta(days=dias)).strftime('%m-%d-%Y')
-        url = (
-            f"https://olinda.bcb.gov.br/olinda/servico/PTAX/versao/v1/odata/"
-            f"CotacaoDolarPeriodo(dataInicial=@dataInicial,dataFinalCotacao=@dataFinalCotacao)"
-            f"?@dataInicial='{data_inicio}'&@dataFinalCotacao='{data_fim}'"
-            f"&$top=100&$format=json&$select=cotacaoVenda,dataHoraCotacao"
-        )
-        print(f"   📡 BCB PTAX: {data_inicio} → {data_fim}")
-        resp = requests.get(url, timeout=15)
-        resp.raise_for_status()
-        dados = resp.json()
-        datas_vistas: set = set()
-        registros = []
-        for item in dados.get('value', []):
-            data = item['dataHoraCotacao'][:10]
-            if data not in datas_vistas:
-                datas_vistas.add(data)
-                registros.append({'produto_id': produto_id, 'fonte_id': BCB_FONTE_ID,
-                                   'valor': item['cotacaoVenda'], 'data_cotacao': data})
-        print(f"   📊 {len(registros)} cotações encontradas")
+        url = (f"https://olinda.bcb.gov.br/olinda/servico/PTAX/versao/v1/odata/"
+               f"CotacaoDolarPeriodo(dataInicial=@dataInicial,dataFinalCotacao=@dataFinalCotacao)"
+               f"?@dataInicial='{(hoje-timedelta(days=dias)).strftime('%m-%d-%Y')}'"
+               f"&@dataFinalCotacao='{hoje.strftime('%m-%d-%Y')}'"
+               f"&$top=100&$format=json&$select=cotacaoVenda,dataHoraCotacao")
+        resp = requests.get(url, timeout=15); resp.raise_for_status()
+        vistas, registros = set(), []
+        for item in resp.json().get('value', []):
+            d = item['dataHoraCotacao'][:10]
+            if d not in vistas:
+                vistas.add(d)
+                registros.append({'produto_id': prod_id, 'fonte_id': BCB_FONTE_ID,
+                                   'valor': item['cotacaoVenda'], 'data_cotacao': d})
+        print(f"   📊 {len(registros)} cotações")
         ok, err = upsert_indicadores(supabase, registros)
         return {'fonte': 'Dólar BCB', 'inseridos': ok, 'erros': err}
     except Exception as e:
-        print(f"   ❌ {e}")
         return {'fonte': 'Dólar BCB', 'inseridos': 0, 'erros': 1, 'excecao': str(e)}
 
-
-# ============================================================
-# FONTE 2 — SELIC (BCB SGS série 432)
-# ============================================================
-
-def sincronizar_selic(supabase: Client, dias: int = 1) -> dict:
-    print("\n" + "─" * 60)
-    print("📈  SELIC (BCB)")
-    print("─" * 60)
+def sincronizar_selic(supabase, dias=1):
+    print("\n" + "─"*60 + "\n📈  SELIC (BCB)\n" + "─"*60)
     try:
-        hoje        = datetime.now()
-        data_fim    = hoje.strftime('%d/%m/%Y')
-        data_inicio = (hoje - timedelta(days=dias)).strftime('%d/%m/%Y')
+        hoje = datetime.now()
         url = (f"https://api.bcb.gov.br/dados/serie/bcdata.sgs.432/dados"
-               f"?formato=json&dataInicial={data_inicio}&dataFinal={data_fim}")
-        print(f"   📡 BCB SGS série 432")
-        resp = requests.get(url, timeout=15)
-        resp.raise_for_status()
-        dados = resp.json()
-        print(f"   📊 {len(dados)} registros encontrados")
+               f"?formato=json&dataInicial={(hoje-timedelta(days=dias)).strftime('%d/%m/%Y')}"
+               f"&dataFinal={hoje.strftime('%d/%m/%Y')}")
+        resp = requests.get(url, timeout=15); resp.raise_for_status()
+        dados = resp.json(); print(f"   📊 {len(dados)} registros")
         registros = []
         for item in dados:
             try:
-                data_iso = datetime.strptime(item['data'], '%d/%m/%Y').strftime('%Y-%m-%d')
-                valor    = float(item['valor'].replace(',', '.'))
                 registros.append({'produto_id': SELIC_PRODUTO_ID, 'fonte_id': BCB_FONTE_ID,
-                                   'valor': valor, 'data_cotacao': data_iso})
-            except Exception:
-                continue
+                    'valor': float(item['valor'].replace(',','.')),
+                    'data_cotacao': datetime.strptime(item['data'],'%d/%m/%Y').strftime('%Y-%m-%d')})
+            except: continue
         ok, err = upsert_indicadores(supabase, registros)
         return {'fonte': 'SELIC BCB', 'inseridos': ok, 'erros': err}
     except Exception as e:
-        print(f"   ❌ {e}")
         return {'fonte': 'SELIC BCB', 'inseridos': 0, 'erros': 1, 'excecao': str(e)}
 
-
-# ============================================================
-# FONTE 3 — IPCA (BCB SGS série 13522)
-# ============================================================
-
-def sincronizar_ipca(supabase: Client, dias: int = 1) -> dict:
-    print("\n" + "─" * 60)
-    print("📊  IPCA (BCB)")
-    print("─" * 60)
+def sincronizar_ipca(supabase, dias=1):
+    print("\n" + "─"*60 + "\n📊  IPCA (BCB)\n" + "─"*60)
     try:
-        hoje       = datetime.now()
-        data_fim   = hoje.strftime('%d/%m/%Y')
-        dias_busca = max(dias, 395)
-        data_inicio = (hoje - timedelta(days=dias_busca)).strftime('%d/%m/%Y')
+        hoje = datetime.now()
         url = (f"https://api.bcb.gov.br/dados/serie/bcdata.sgs.13522/dados"
-               f"?formato=json&dataInicial={data_inicio}&dataFinal={data_fim}")
-        print(f"   📡 BCB SGS série 13522")
-        resp = requests.get(url, timeout=15)
-        resp.raise_for_status()
-        dados = resp.json()
-        print(f"   📊 {len(dados)} meses encontrados")
+               f"?formato=json&dataInicial={(hoje-timedelta(days=max(dias,395))).strftime('%d/%m/%Y')}"
+               f"&dataFinal={hoje.strftime('%d/%m/%Y')}")
+        resp = requests.get(url, timeout=15); resp.raise_for_status()
+        dados = resp.json(); print(f"   📊 {len(dados)} meses")
         registros = []
         for item in dados:
             try:
-                data_ref = datetime.strptime(item['data'], '%d/%m/%Y')
-                valor    = float(item['valor'].replace(',', '.'))
-                proximo_mes = (data_ref.replace(month=data_ref.month + 1, day=1)
-                               if data_ref.month < 12
-                               else data_ref.replace(year=data_ref.year + 1, month=1, day=1))
-                dia_atual = data_ref
-                while dia_atual < proximo_mes:
-                    if dia_atual.date() <= hoje.date():
+                dr = datetime.strptime(item['data'], '%d/%m/%Y')
+                v  = float(item['valor'].replace(',','.'))
+                pm = dr.replace(month=dr.month+1,day=1) if dr.month<12 else dr.replace(year=dr.year+1,month=1,day=1)
+                d  = dr
+                while d < pm:
+                    if d.date() <= hoje.date():
                         registros.append({'produto_id': IPCA_PRODUTO_ID, 'fonte_id': BCB_FONTE_ID,
-                                          'valor': valor, 'data_cotacao': dia_atual.strftime('%Y-%m-%d')})
-                    dia_atual += timedelta(days=1)
-            except Exception:
-                continue
+                                          'valor': v, 'data_cotacao': d.strftime('%Y-%m-%d')})
+                    d += timedelta(days=1)
+            except: continue
         print(f"   📊 {len(registros)} registros diários")
         ok, err = upsert_indicadores(supabase, registros)
         return {'fonte': 'IPCA BCB', 'inseridos': ok, 'erros': err}
     except Exception as e:
-        print(f"   ❌ {e}")
         return {'fonte': 'IPCA BCB', 'inseridos': 0, 'erros': 1, 'excecao': str(e)}
 
 
-# ============================================================
-# FONTE 4 — INVESTING.COM (Selenium)
-# ============================================================
+# ── Investing.com (Selenium) ─────────────────────────────────
 
 def _criar_driver():
     try:
         from selenium import webdriver
         from selenium.webdriver.chrome.options import Options
         opts = Options()
-        for arg in ['--headless', '--no-sandbox', '--disable-dev-shm-usage',
-                    '--disable-gpu', '--window-size=1920,1080', '--lang=pt-BR']:
-            opts.add_argument(arg)
+        for a in ['--headless','--no-sandbox','--disable-dev-shm-usage','--disable-gpu',
+                  '--window-size=1920,1080','--lang=pt-BR']:
+            opts.add_argument(a)
         opts.add_argument('user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
                           'AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36')
         return webdriver.Chrome(options=opts)
     except Exception as e:
-        print(f"   ❌ Erro ao criar driver: {e}")
-        return None
+        print(f"   ❌ driver: {e}"); return None
 
+def _limpar_numero(t):
+    if not t: return None
+    t = re.sub(r'[R$\s%]','',t).strip(); t = re.sub(r'[^\d.,]','',t)
+    if not t: return None
+    if ',' in t and '.' in t:
+        t = t.replace('.','').replace(',','.') if t.index('.')<t.index(',') else t.replace(',','')
+    elif ',' in t: t = t.replace(',','.')
+    try: return float(t)
+    except: return None
 
-def _limpar_numero(texto: str):
-    if not texto:
-        return None
-    texto = re.sub(r'[R$\s%]', '', texto).strip()
-    texto = re.sub(r'[^\d.,]', '', texto)
-    if not texto:
-        return None
-    if ',' in texto and '.' in texto:
-        texto = texto.replace('.', '').replace(',', '.') if texto.index('.') < texto.index(',') else texto.replace(',', '')
-    elif ',' in texto:
-        texto = texto.replace(',', '.')
-    try:
-        return float(texto)
-    except ValueError:
-        return None
-
-
-def _converter_data(texto: str):
-    if not texto:
-        return None
-    texto = texto.strip()
-    m = re.match(r'^(\d{2})\.(\d{2})\.(\d{4})$', texto)
-    if m:
-        return f"{m.group(3)}-{m.group(2)}-{m.group(1)}"
-    m = re.match(r'^(\d{2})/(\d{2})/(\d{4})$', texto)
-    if m:
-        return f"{m.group(3)}-{m.group(2)}-{m.group(1)}"
-    meses = {'jan':'01','fev':'02','feb':'02','mar':'03','abr':'04','apr':'04',
-             'mai':'05','may':'05','jun':'06','jul':'07','ago':'08','aug':'08',
-             'set':'09','sep':'09','out':'10','oct':'10','nov':'11','dez':'12','dec':'12'}
-    m = re.match(r'(\w+)\.?\s+(\d{1,2}),?\s+(\d{4})', texto, re.IGNORECASE)
+def _converter_data(t):
+    if not t: return None
+    t = t.strip()
+    for pat, fmt in [(r'^(\d{2})\.(\d{2})\.(\d{4})$', lambda m: f"{m.group(3)}-{m.group(2)}-{m.group(1)}"),
+                     (r'^(\d{2})/(\d{2})/(\d{4})$',     lambda m: f"{m.group(3)}-{m.group(2)}-{m.group(1)}")]:
+        m = re.match(pat, t)
+        if m: return fmt(m)
+    meses = {'jan':'01','fev':'02','feb':'02','mar':'03','abr':'04','apr':'04','mai':'05','may':'05',
+             'jun':'06','jul':'07','ago':'08','aug':'08','set':'09','sep':'09','out':'10','oct':'10',
+             'nov':'11','dez':'12','dec':'12'}
+    m = re.match(r'(\w+)\.?\s+(\d{1,2}),?\s+(\d{4})',t,re.I)
     if m:
         mes = meses.get(m.group(1).lower()[:3])
-        if mes:
-            return f"{m.group(3)}-{mes}-{m.group(2).zfill(2)}"
-    m = re.match(r'^(\d{4}-\d{2}-\d{2})', texto)
-    if m:
-        return m.group(1)
+        if mes: return f"{m.group(3)}-{mes}-{m.group(2).zfill(2)}"
+    m = re.match(r'^(\d{4}-\d{2}-\d{2})',t)
+    if m: return m.group(1)
     return None
 
-
-def _detectar_moeda(soup) -> str:
-    texto = soup.get_text()
-    for padrao in [r'[Mm]oeda\s+em\s+(BRL|USD|EUR)', r'Traded in\s+(BRL|USD|EUR)']:
-        m = re.search(padrao, texto)
-        if m:
-            return m.group(1).upper()
-    elem = soup.find(attrs={'data-test': 'base-currency-label'})
-    if elem:
-        moeda = elem.get_text(strip=True).upper()
-        if moeda in ('BRL', 'USD', 'EUR'):
-            return moeda
+def _detectar_moeda(soup):
+    for p in [r'[Mm]oeda\s+em\s+(BRL|USD|EUR)', r'Traded in\s+(BRL|USD|EUR)']:
+        m = re.search(p, soup.get_text())
+        if m: return m.group(1).upper()
+    e = soup.find(attrs={'data-test':'base-currency-label'})
+    if e and e.get_text(strip=True).upper() in ('BRL','USD','EUR'):
+        return e.get_text(strip=True).upper()
     return 'BRL'
 
-
-def _montar_registro_cotacao(config, preco, moeda, data) -> dict:
-    reg = {'produto_id': config['produto_id'], 'fonte_id': INVESTING_FONTE_ID,
-           'regiao_id': config['regiao_id'], 'data_cotacao': data}
-    if moeda == 'USD':
-        reg['preco_usd'] = preco
-    else:
-        reg['preco_brl'] = preco
-    return reg
-
-
-def sincronizar_investing(supabase: Client, dias: int = 1) -> dict:
-    print("\n" + "─" * 60)
-    print(f"📈  INVESTING.COM  [{'dia atual' if dias == 1 else f'últimos {dias} dias'}]")
-    print("─" * 60)
+def sincronizar_investing(supabase, dias=1):
+    print("\n" + "─"*60 + f"\n📈  INVESTING.COM  [{'dia atual' if dias==1 else f'últimos {dias} dias'}]\n" + "─"*60)
     try:
         from selenium.webdriver.common.by import By
         from selenium.webdriver.support.ui import WebDriverWait
         from selenium.webdriver.support import expected_conditions as EC
     except ImportError:
-        return {'fonte': 'Investing.com', 'inseridos': 0, 'erros': 0, 'aviso': 'Selenium não instalado'}
+        return {'fonte':'Investing.com','inseridos':0,'erros':0,'aviso':'Selenium não instalado'}
 
     driver = _criar_driver()
     if not driver:
-        return {'fonte': 'Investing.com', 'inseridos': 0, 'erros': 0, 'aviso': 'Falha ao iniciar o navegador'}
+        return {'fonte':'Investing.com','inseridos':0,'erros':0,'aviso':'Falha no driver'}
 
-    todas_cotacoes = []
+    cotacoes = []
     try:
-        for config in SCRAPING_CONFIG:
-            print(f"\n   📊 {config['nome']}")
+        for cfg in SCRAPING_CONFIG:
+            print(f"\n   📊 {cfg['nome']}")
             try:
                 if dias == 1:
-                    url = config['url_atual']
-                    driver.get(url)
-                    try:
-                        WebDriverWait(driver, 15).until(
-                            EC.presence_of_element_located(
-                                (By.CSS_SELECTOR, '[data-test="instrument-price-last"]')))
-                    except Exception:
-                        time.sleep(7)
-                    soup  = BeautifulSoup(driver.page_source, 'html.parser')
+                    driver.get(cfg['url_atual'])
+                    try: WebDriverWait(driver,15).until(EC.presence_of_element_located((By.CSS_SELECTOR,'[data-test="instrument-price-last"]')))
+                    except: time.sleep(7)
+                    soup  = BeautifulSoup(driver.page_source,'html.parser')
                     moeda = _detectar_moeda(soup)
-                    preco_str = None
-                    for sel in [
-                        lambda s: s.find(attrs={'data-test': 'instrument-price-last'}),
-                        lambda s: s.find(id='last_last'),
-                        lambda s: s.find('span', class_=re.compile(r'text-5xl')),
-                    ]:
-                        elem = sel(soup)
-                        if elem:
-                            preco_str = elem.get_text(strip=True)
-                            break
-                    if preco_str:
-                        preco = _limpar_numero(preco_str)
-                        if preco and preco > 0:
-                            data_hoje = datetime.now().strftime('%Y-%m-%d')
-                            todas_cotacoes.append(
-                                _montar_registro_cotacao(config, preco, moeda, data_hoje))
+                    ps = None
+                    for fn in [lambda s:s.find(attrs={'data-test':'instrument-price-last'}),
+                               lambda s:s.find(id='last_last'),
+                               lambda s:s.find('span',class_=re.compile(r'text-5xl'))]:
+                        e = fn(soup)
+                        if e: ps = e.get_text(strip=True); break
+                    if ps:
+                        p = _limpar_numero(ps)
+                        if p and p>0:
+                            reg = {'produto_id':cfg['produto_id'],'fonte_id':INVESTING_FONTE_ID,
+                                   'regiao_id':cfg['regiao_id'],'data_cotacao':datetime.now().strftime('%Y-%m-%d')}
+                            reg['preco_usd' if moeda=='USD' else 'preco_brl'] = p
+                            cotacoes.append(reg)
                 else:
-                    url = config['url_historico']
-                    driver.get(url)
-                    try:
-                        WebDriverWait(driver, 20).until(
-                            EC.presence_of_element_located((By.CSS_SELECTOR, 'table tbody tr td')))
-                    except Exception:
-                        time.sleep(10)
-                    soup   = BeautifulSoup(driver.page_source, 'html.parser')
-                    moeda  = _detectar_moeda(soup)
-                    tabela = None
-                    for candidato in [
-                        soup.find('table', {'id': re.compile(r'curr_table|historicalTbl', re.I)}),
-                        soup.find('table', class_=re.compile(r'freeze-column-w-1|historical', re.I)),
-                    ]:
-                        if candidato and candidato.find('tbody'):
-                            tabela = candidato
-                            break
-                    if not tabela:
+                    driver.get(cfg['url_historico'])
+                    try: WebDriverWait(driver,20).until(EC.presence_of_element_located((By.CSS_SELECTOR,'table tbody tr td')))
+                    except: time.sleep(10)
+                    soup  = BeautifulSoup(driver.page_source,'html.parser')
+                    moeda = _detectar_moeda(soup)
+                    tab = None
+                    for c in [soup.find('table',{'id':re.compile(r'curr_table|historicalTbl',re.I)}),
+                               soup.find('table',class_=re.compile(r'freeze-column-w-1|historical',re.I))]:
+                        if c and c.find('tbody'): tab = c; break
+                    if not tab:
                         for t in soup.find_all('table'):
-                            if t.find('tbody') and len(t.find('tbody').find_all('tr')) > 5:
-                                tabela = t
-                                break
-                    if tabela:
-                        data_limite = datetime.now() - timedelta(days=dias)
-                        for linha in tabela.find('tbody').find_all('tr'):
+                            if t.find('tbody') and len(t.find('tbody').find_all('tr'))>5: tab=t; break
+                    if tab:
+                        lim = datetime.now()-timedelta(days=dias)
+                        for linha in tab.find('tbody').find_all('tr'):
                             cols = linha.find_all('td')
-                            if len(cols) < 2:
-                                continue
-                            data_iso = _converter_data(cols[0].get_text(strip=True))
-                            if not data_iso:
-                                continue
-                            if datetime.strptime(data_iso, '%Y-%m-%d') < data_limite:
-                                break
-                            preco = _limpar_numero(cols[1].get_text(strip=True))
-                            if preco and preco > 0:
-                                todas_cotacoes.append(
-                                    _montar_registro_cotacao(config, preco, moeda, data_iso))
+                            if len(cols)<2: continue
+                            di = _converter_data(cols[0].get_text(strip=True))
+                            if not di or datetime.strptime(di,'%Y-%m-%d')<lim: break
+                            p = _limpar_numero(cols[1].get_text(strip=True))
+                            if p and p>0:
+                                reg = {'produto_id':cfg['produto_id'],'fonte_id':INVESTING_FONTE_ID,
+                                       'regiao_id':cfg['regiao_id'],'data_cotacao':di}
+                                reg['preco_usd' if moeda=='USD' else 'preco_brl'] = p
+                                cotacoes.append(reg)
             except Exception as e:
-                print(f"   ⚠️  Erro em {config['nome']}: {e}")
+                print(f"   ⚠️  {cfg['nome']}: {e}")
             time.sleep(3)
     finally:
-        driver.quit()
-        print("\n   🌐 Navegador fechado")
+        driver.quit(); print("\n   🌐 Navegador fechado")
 
-    ok, err = upsert_cotacoes(supabase, todas_cotacoes)
-    return {'fonte': 'Investing.com', 'inseridos': ok, 'erros': err}
+    ok, err = upsert_cotacoes(supabase, cotacoes)
+    return {'fonte':'Investing.com','inseridos':ok,'erros':err}
 
 
-# ============================================================
-# FONTE 5 — YAHOO FINANCE (yfinance)
-# CORREÇÃO: tickers CBOT (ZS, ZC, KC) são cotados em USd (centavos).
-# Dividimos pelo campo 'divisor' do config antes de salvar.
-# ============================================================
+# ── Yahoo Finance ────────────────────────────────────────────
 
-def sincronizar_yahoo(supabase: Client, dias: int = 1) -> dict:
-    print("\n" + "─" * 60)
-    print(f"📈  YAHOO FINANCE  [{'dia atual' if dias == 1 else f'últimos {dias} dias'}]")
-    print("─" * 60)
+def sincronizar_yahoo(supabase, dias=1):
+    print("\n" + "─"*60 + f"\n📈  YAHOO FINANCE  [{'dia atual' if dias==1 else f'últimos {dias} dias'}]\n" + "─"*60)
     try:
         import yfinance as yf
     except ImportError:
-        return {'fonte': 'Yahoo Finance', 'inseridos': 0, 'erros': 0,
-                'aviso': 'yfinance não instalado (pip install yfinance)'}
+        return {'fonte':'Yahoo Finance','inseridos':0,'erros':0,'aviso':'yfinance não instalado'}
 
     registros = []
-    period = '1d' if dias == 1 else f'{dias}d'
-
-    for config in YAHOO_CONFIG:
-        divisor = config.get('divisor', 1)
-        print(f"   📊 {config['nome']} ({config['ticker']}) — divisor: {divisor}")
+    for cfg in YAHOO_CONFIG:
+        div = cfg.get('divisor', 1)
+        print(f"   📊 {cfg['nome']} ({cfg['ticker']}) divisor:{div}")
         try:
-            ticker = yf.Ticker(config['ticker'])
-            hist   = ticker.history(period=period)
-            if hist.empty:
-                print(f"   ⚠️  Sem dados para {config['ticker']}")
-                continue
-            for data_idx, row in hist.iterrows():
-                data_iso = data_idx.strftime('%Y-%m-%d')
-                # Divide pelo divisor para converter USd → USD quando necessário
-                preco    = round(float(row['Close']) / divisor, 4)
-                reg = {
-                    'produto_id':   config['produto_id'],
-                    'fonte_id':     YAHOO_FONTE_ID,
-                    'regiao_id':    config['regiao_id'],
-                    'data_cotacao': data_iso,
-                }
-                if config['moeda'] == 'USD':
-                    reg['preco_usd'] = preco
-                else:
-                    reg['preco_brl'] = preco
+            hist = yf.Ticker(cfg['ticker']).history(period='1d' if dias==1 else f'{dias}d')
+            if hist.empty: print(f"   ⚠️  Sem dados"); continue
+            for idx, row in hist.iterrows():
+                preco = round(float(row['Close']) / div, 4)
+                reg = {'produto_id':cfg['produto_id'],'fonte_id':YAHOO_FONTE_ID,
+                       'regiao_id':cfg['regiao_id'],'data_cotacao':idx.strftime('%Y-%m-%d')}
+                reg['preco_usd' if cfg['moeda']=='USD' else 'preco_brl'] = preco
                 registros.append(reg)
             print(f"   ✅ {len(hist)} registros")
         except Exception as e:
-            print(f"   ⚠️  Erro em {config['nome']}: {e}")
+            print(f"   ⚠️  {cfg['nome']}: {e}")
 
     ok, err = upsert_cotacoes(supabase, registros)
-    return {'fonte': 'Yahoo Finance', 'inseridos': ok, 'erros': err}
+    return {'fonte':'Yahoo Finance','inseridos':ok,'erros':err}
 
 
-# ============================================================
-# FONTE 6 — ALPHA VANTAGE (API REST)
-# ============================================================
+# ── Alpha Vantage ────────────────────────────────────────────
 
-def sincronizar_alpha(supabase: Client, dias: int = 1) -> dict:
-    print("\n" + "─" * 60)
-    print(f"📈  ALPHA VANTAGE  [{'dia atual' if dias == 1 else f'últimos {dias} dias'}]")
-    print("─" * 60)
-
+def sincronizar_alpha(supabase, dias=1):
+    print("\n" + "─"*60 + f"\n📈  ALPHA VANTAGE  [{'dia atual' if dias==1 else f'últimos {dias} dias'}]\n" + "─"*60)
     if not ALPHA_VANTAGE_KEY:
-        return {'fonte': 'Alpha Vantage', 'inseridos': 0, 'erros': 0,
-                'aviso': 'ALPHA_VANTAGE_KEY não configurada'}
+        return {'fonte':'Alpha Vantage','inseridos':0,'erros':0,'aviso':'ALPHA_VANTAGE_KEY não configurada'}
 
-    registros   = []
-    data_limite = (datetime.now() - timedelta(days=dias)).strftime('%Y-%m-%d')
-
-    for config in ALPHA_CONFIG:
-        print(f"   📊 {config['nome']} ({config['function']})")
+    registros = []
+    lim = (datetime.now()-timedelta(days=dias)).strftime('%Y-%m-%d')
+    for cfg in ALPHA_CONFIG:
+        print(f"   📊 {cfg['nome']} ({cfg['function']})")
         try:
-            params = {
-                'function':   config['function'],
-                'interval':   'daily',
-                'datatype':   'json',
-                'apikey':     ALPHA_VANTAGE_KEY,
-            }
-            resp = requests.get(ALPHA_BASE_URL, params=params, timeout=20)
+            resp = requests.get(ALPHA_BASE_URL, timeout=20,
+                params={'function':cfg['function'],'interval':'daily','datatype':'json','apikey':ALPHA_VANTAGE_KEY})
             resp.raise_for_status()
-            data = resp.json()
+            serie = resp.json().get('data',[])
+            if not serie: print(f"   ⚠️  Sem dados"); continue
+            count = 0
+            for p in serie:
+                di = p.get('date','')
+                if di < lim: break
+                v = p.get('value','')
+                if not v or v=='.': continue
+                reg = {'produto_id':cfg['produto_id'],'fonte_id':ALPHA_FONTE_ID,
+                       'regiao_id':cfg['regiao_id'],'data_cotacao':di}
+                reg['preco_usd' if cfg['moeda']=='USD' else 'preco_brl'] = round(float(v),4)
+                registros.append(reg); count += 1
+            print(f"   ✅ {count} registros")
+            time.sleep(13)
+        except Exception as e:
+            print(f"   ⚠️  {cfg['nome']}: {e}")
 
-            serie = data.get('data', [])
-            if not serie:
-                print(f"   ⚠️  Sem dados (resposta: {list(data.keys())})")
+    ok, err = upsert_cotacoes(supabase, registros)
+    return {'fonte':'Alpha Vantage','inseridos':ok,'erros':err}
+
+
+# ── CEPEA/ESALQ (scraping HTML) ──────────────────────────────
+
+def sincronizar_cepea(supabase, dias=1):
+    print("\n" + "─"*60 + f"\n🌾  CEPEA/ESALQ  [{'dia atual' if dias==1 else f'últimos {dias} dias'}]\n" + "─"*60)
+
+    HEADERS = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+        'Accept-Language': 'pt-BR,pt;q=0.9',
+    }
+
+    def _parse_data_cepea(txt):
+        """Converte 'DD/MM/YYYY' ou 'DD-MM-YYYY' para 'YYYY-MM-DD'."""
+        txt = txt.strip()
+        for sep in ['/', '-']:
+            parts = txt.split(sep)
+            if len(parts) == 3 and len(parts[2]) == 4:
+                return f"{parts[2]}-{parts[1].zfill(2)}-{parts[0].zfill(2)}"
+        return None
+
+    def _parse_valor_cepea(txt):
+        """Converte '59,66' ou '1.234,56' para float."""
+        txt = txt.strip().replace('.', '').replace(',', '.')
+        try: return round(float(txt), 4)
+        except: return None
+
+    registros = []
+    lim = (datetime.now() - timedelta(days=dias)).date()
+
+    for cfg in CEPEA_CONFIG:
+        print(f"\n   📊 {cfg['nome']}")
+        try:
+            resp = requests.get(cfg['url'], headers=HEADERS, timeout=20)
+            resp.raise_for_status()
+            soup = BeautifulSoup(resp.text, 'html.parser')
+            tabelas = soup.find_all('table')
+
+            if cfg['tabela_idx'] >= len(tabelas):
+                print(f"   ⚠️  Tabela {cfg['tabela_idx']} não encontrada (total: {len(tabelas)})")
                 continue
 
+            tab = tabelas[cfg['tabela_idx']]
+            linhas = tab.find('tbody').find_all('tr') if tab.find('tbody') else tab.find_all('tr')[1:]
+
             count = 0
-            for ponto in serie:
-                data_iso = ponto.get('date', '')
-                if data_iso < data_limite:
-                    break
-                valor = ponto.get('value', '')
-                if not valor or valor == '.':
+            valores_dia = {}  # data → lista de valores (para fazer média no feijão)
+
+            for linha in linhas:
+                cols = linha.find_all('td')
+                if len(cols) <= max(cfg['col_data'], cfg['col_valor']):
                     continue
-                preco = round(float(valor), 4)
+                data_txt  = cols[cfg['col_data']].get_text(strip=True)
+                valor_txt = cols[cfg['col_valor']].get_text(strip=True)
+                data_iso  = _parse_data_cepea(data_txt)
+                valor     = _parse_valor_cepea(valor_txt)
+                if not data_iso or not valor:
+                    continue
+                from datetime import date
+                try:
+                    data_obj = datetime.strptime(data_iso, '%Y-%m-%d').date()
+                except:
+                    continue
+                if data_obj < lim:
+                    continue
+                if data_iso not in valores_dia:
+                    valores_dia[data_iso] = []
+                valores_dia[data_iso].append(valor)
+
+            # Feijão: usa média das regiões do dia
+            # Arroz: já tem uma linha por dia (indicador único)
+            for data_iso, vals in sorted(valores_dia.items(), reverse=True):
+                media = round(sum(vals) / len(vals), 4)
                 reg = {
-                    'produto_id':   config['produto_id'],
-                    'fonte_id':     ALPHA_FONTE_ID,
-                    'regiao_id':    config['regiao_id'],
+                    'produto_id':   cfg['produto_id'],
+                    'fonte_id':     CEPEA_FONTE_ID,
+                    'regiao_id':    cfg['regiao_id'],
                     'data_cotacao': data_iso,
+                    'preco_brl':    media,
                 }
-                if config['moeda'] == 'USD':
-                    reg['preco_usd'] = preco
-                else:
-                    reg['preco_brl'] = preco
                 registros.append(reg)
                 count += 1
 
-            print(f"   ✅ {count} registros")
-            time.sleep(13)  # respeita limite 5 req/min do plano free
+            print(f"   ✅ {count} datas, último valor: {list(valores_dia.values())[0] if valores_dia else '—'}")
 
         except Exception as e:
-            print(f"   ⚠️  Erro em {config['nome']}: {e}")
+            print(f"   ⚠️  {cfg['nome']}: {e}")
 
     ok, err = upsert_cotacoes(supabase, registros)
-    return {'fonte': 'Alpha Vantage', 'inseridos': ok, 'erros': err}
+    return {'fonte':'CEPEA/ESALQ','inseridos':ok,'erros':err}
 
 
-# ============================================================
-# MAIN
-# ============================================================
+# ── Main ─────────────────────────────────────────────────────
 
-FONTES_DISPONIVEIS = {
+FONTES = {
     'dolar':     sincronizar_dolar,
     'selic':     sincronizar_selic,
     'ipca':      sincronizar_ipca,
     'investing': sincronizar_investing,
     'yahoo':     sincronizar_yahoo,
     'alpha':     sincronizar_alpha,
+    'cepea':     sincronizar_cepea,
 }
 
-
 def main():
-    parser = argparse.ArgumentParser(
-        description='Sincroniza cotações de todas as fontes para o Supabase')
-    parser.add_argument('--dias', type=int, default=1,
-                        help='Dias retroativos (padrão: 1)')
-    parser.add_argument('--fonte', choices=list(FONTES_DISPONIVEIS.keys()),
-                        default=None, help='Executar apenas uma fonte específica')
-    args = parser.parse_args()
+    p = argparse.ArgumentParser()
+    p.add_argument('--dias',  type=int, default=1)
+    p.add_argument('--fonte', choices=list(FONTES.keys()), default=None)
+    args = p.parse_args()
     dias = max(1, args.dias)
 
-    print("=" * 60)
+    print("="*60)
     print("🌾  SINCRONIZAÇÃO COMPLETA → SUPABASE")
-    print(f"    Período: {'dia atual' if dias == 1 else f'últimos {dias} dias'}")
-    print("=" * 60)
+    print(f"    Período: {'dia atual' if dias==1 else f'últimos {dias} dias'}")
+    print("="*60)
 
     try:
         supabase = conectar_supabase()
         print("✅ Supabase conectado\n")
     except EnvironmentError as e:
-        print(f"\n❌ ERRO: {e}")
-        sys.exit(1)
+        print(f"\n❌ {e}"); sys.exit(1)
 
-    fontes = ({args.fonte: FONTES_DISPONIVEIS[args.fonte]}
-              if args.fonte else FONTES_DISPONIVEIS)
-
+    fontes = {args.fonte: FONTES[args.fonte]} if args.fonte else FONTES
     resultados = []
     for nome, fn in fontes.items():
         try:
-            res = fn(supabase=supabase, dias=dias)
-            resultados.append(res)
+            resultados.append(fn(supabase=supabase, dias=dias))
         except Exception as e:
-            print(f"\n❌ Erro na fonte '{nome}': {e}")
-            traceback.print_exc()
-            resultados.append({'fonte': nome, 'inseridos': 0, 'erros': -1, 'excecao': str(e)})
+            print(f"\n❌ '{nome}': {e}"); traceback.print_exc()
+            resultados.append({'fonte':nome,'inseridos':0,'erros':-1,'excecao':str(e)})
 
-    print("\n" + "=" * 60)
-    print("📋  RESULTADO FINAL")
-    print("=" * 60)
-    total_ok = total_err = 0
-    tudo_ok  = True
+    print("\n" + "="*60 + "\n📋  RESULTADO FINAL\n" + "="*60)
+    tok = terr = 0
+    ok_geral = True
     for r in resultados:
-        ok  = r.get('inseridos', 0)
-        err = r.get('erros', 0)
-        total_ok  += ok
-        total_err += err
-        status = "✅" if err == 0 and not r.get('excecao') else "⚠️ " if ok > 0 else "❌"
-        linha  = f"  {status}  {r['fonte']:20}  inseridos: {ok:4d}  erros: {err:4d}"
-        if r.get('aviso'):
-            linha += f"  [{r['aviso']}]"
-        if r.get('excecao'):
-            linha += f"  [EXCEÇÃO: {r['excecao']}]"
-            tudo_ok = False
-        if err > 0:
-            tudo_ok = False
+        ok = r.get('inseridos',0); err = r.get('erros',0)
+        tok += ok; terr += err
+        st = "✅" if err==0 and not r.get('excecao') else "⚠️ " if ok>0 else "❌"
+        linha = f"  {st}  {r['fonte']:22}  inseridos: {ok:4d}  erros: {err:4d}"
+        if r.get('aviso'):   linha += f"  [{r['aviso']}]"
+        if r.get('excecao'): linha += f"  [EXCEÇÃO]"; ok_geral = False
+        if err > 0: ok_geral = False
         print(linha)
-    print("─" * 60)
-    print(f"  {'TOTAL':22}  inseridos: {total_ok:4d}  erros: {total_err:4d}")
-    print("=" * 60)
-    print("\n🟢  CONCLUÍDO COM SUCESSO\n" if tudo_ok else "\n🔴  CONCLUÍDO COM ERROS\n")
-    sys.exit(0 if tudo_ok else 1)
-
+    print("─"*60)
+    print(f"  {'TOTAL':24}  inseridos: {tok:4d}  erros: {terr:4d}")
+    print("="*60)
+    print("\n🟢  CONCLUÍDO COM SUCESSO\n" if ok_geral else "\n🔴  CONCLUÍDO COM ERROS\n")
+    sys.exit(0 if ok_geral else 1)
 
 if __name__ == '__main__':
     main()
