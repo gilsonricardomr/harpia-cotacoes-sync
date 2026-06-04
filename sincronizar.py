@@ -44,6 +44,12 @@ CHROME_BINARY_PATHS = [
     '/usr/bin/chromium',
 ]
 
+# ── Tempos de espera para o Investing.com ─────────────────────
+# Entre tentativas 403: 30s (3x o valor anterior de 10s)
+# Entre produtos:       24s (3x o valor anterior de 8s)
+INVESTING_SLEEP_RETRY   = 30
+INVESTING_SLEEP_PRODUTO = 24
+
 
 def conectar_supabase():
     if not SUPABASE_URL or not SUPABASE_KEY:
@@ -214,16 +220,16 @@ def _fetch_investing(url: str, tentativas: int = 3) -> BeautifulSoup | None:
                 titulo = BeautifulSoup(resp.text,'html.parser').find('title')
                 titulo_txt = titulo.text.strip() if titulo else ''
                 if 'Just a moment' in titulo_txt or 'Attention Required' in titulo_txt:
-                    print(f"   ⚠️  Cloudflare ativo (tentativa {i+1}/{tentativas})")
-                    time.sleep(10)
+                    print(f"   ⚠️  Cloudflare ativo (tentativa {i+1}/{tentativas}) — aguardando {INVESTING_SLEEP_RETRY}s")
+                    time.sleep(INVESTING_SLEEP_RETRY)
                     continue
                 return BeautifulSoup(resp.text, 'html.parser')
             else:
-                print(f"   ⚠️  HTTP {resp.status_code} (tentativa {i+1}/{tentativas})")
-                time.sleep(10)  # aguarda mais entre tentativas 403
+                print(f"   ⚠️  HTTP {resp.status_code} (tentativa {i+1}/{tentativas}) — aguardando {INVESTING_SLEEP_RETRY}s")
+                time.sleep(INVESTING_SLEEP_RETRY)
         except Exception as e:
             print(f"   ⚠️  Erro (tentativa {i+1}/{tentativas}): {e}")
-            time.sleep(10)
+            time.sleep(INVESTING_SLEEP_RETRY)
     return None
 
 def _extrair_preco_investing(soup) -> str | None:
@@ -247,14 +253,15 @@ def _extrair_preco_investing(soup) -> str | None:
 
 def sincronizar_investing(supabase, dias=1):
     print("\n" + "─"*60 + f"\n📈  INVESTING.COM  [{'dia atual' if dias==1 else f'últimos {dias} dias'}]\n" + "─"*60)
+    print(f"   ⏱️  Sleep entre produtos: {INVESTING_SLEEP_PRODUTO}s | entre tentativas: {INVESTING_SLEEP_RETRY}s")
 
     cotacoes = []
 
     for idx, cfg in enumerate(SCRAPING_CONFIG):
         print(f"\n   📊 {cfg['nome']}")
-        # Pausa maior entre produtos para não acionar rate limit do Cloudflare
         if idx > 0:
-            time.sleep(8)
+            print(f"   ⏳ Aguardando {INVESTING_SLEEP_PRODUTO}s antes do próximo produto...")
+            time.sleep(INVESTING_SLEEP_PRODUTO)
         try:
             if dias == 1:
                 soup = _fetch_investing(cfg['url_atual'])
