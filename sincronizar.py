@@ -44,6 +44,15 @@ IPCA_PRODUTO_ID  = '81719845-bca4-44ff-838d-11411c9136ed'
 SUPABASE_URL = os.environ.get('SUPABASE_URL')
 SUPABASE_KEY = os.environ.get('SUPABASE_KEY')
 
+# Caminho do Chrome instalado pelo browser-actions/setup-chrome no GitHub Actions
+# Em ambiente local (Mac/Windows) o webdriver-manager resolve automaticamente
+CHROME_BINARY_PATHS = [
+    '/opt/hostedtoolcache/setup-chrome/chromium/stable/x64/chrome',  # GitHub Actions
+    '/usr/bin/google-chrome',
+    '/usr/bin/chromium-browser',
+    '/usr/bin/chromium',
+]
+
 
 def conectar_supabase():
     if not SUPABASE_URL or not SUPABASE_KEY:
@@ -150,19 +159,35 @@ def sincronizar_ipca(supabase, dias=1):
         return {'fonte':'IPCA BCB','inseridos':0,'erros':1,'excecao':str(e)}
 
 
-# ── Selenium (compartilhado Investing.com e CEPEA) ────────────
+# ── Selenium ──────────────────────────────────────────────────
+# Corrige o problema de timeout no GitHub Actions apontando
+# explicitamente para o binário instalado pelo setup-chrome.
 
 def _criar_driver():
     try:
         from selenium import webdriver
         from selenium.webdriver.chrome.options import Options
+        from selenium.webdriver.chrome.service import Service
+        from webdriver_manager.chrome import ChromeDriverManager
+
         opts = Options()
         for a in ['--headless','--no-sandbox','--disable-dev-shm-usage','--disable-gpu',
-                  '--window-size=1920,1080','--lang=pt-BR']:
+                  '--window-size=1920,1080','--lang=pt-BR','--disable-blink-features=AutomationControlled']:
             opts.add_argument(a)
         opts.add_argument('user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
                           'AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36')
-        return webdriver.Chrome(options=opts)
+
+        # Tenta usar o Chrome do setup-chrome (GitHub Actions)
+        for path in CHROME_BINARY_PATHS:
+            if os.path.exists(path):
+                opts.binary_location = path
+                print(f"   🌐 Chrome: {path}")
+                break
+
+        # webdriver-manager instala o ChromeDriver compatível automaticamente
+        service = Service(ChromeDriverManager().install())
+        return webdriver.Chrome(service=service, options=opts)
+
     except Exception as e:
         print(f"   ❌ driver: {e}"); return None
 
@@ -226,8 +251,8 @@ def sincronizar_investing(supabase, dias=1):
             try:
                 if dias == 1:
                     driver.get(cfg['url_atual'])
-                    try: WebDriverWait(driver,15).until(EC.presence_of_element_located((By.CSS_SELECTOR,'[data-test="instrument-price-last"]')))
-                    except: time.sleep(7)
+                    try: WebDriverWait(driver,20).until(EC.presence_of_element_located((By.CSS_SELECTOR,'[data-test="instrument-price-last"]')))
+                    except: time.sleep(8)
                     soup  = BeautifulSoup(driver.page_source,'html.parser')
                     moeda = _detectar_moeda(soup)
                     ps = None
@@ -243,6 +268,11 @@ def sincronizar_investing(supabase, dias=1):
                                    'regiao_id':cfg['regiao_id'],'data_cotacao':datetime.now().strftime('%Y-%m-%d')}
                             reg['preco_usd' if moeda=='USD' else 'preco_brl'] = p
                             cotacoes.append(reg)
+                            print(f"   ✅ {p} {moeda}")
+                        else:
+                            print(f"   ⚠️  Preço inválido: {ps}")
+                    else:
+                        print(f"   ⚠️  Preço não encontrado na página")
                 else:
                     driver.get(cfg['url_historico'])
                     try: WebDriverWait(driver,20).until(EC.presence_of_element_located((By.CSS_SELECTOR,'table tbody tr td')))
@@ -258,6 +288,7 @@ def sincronizar_investing(supabase, dias=1):
                             if t.find('tbody') and len(t.find('tbody').find_all('tr'))>5: tab=t; break
                     if tab:
                         lim = datetime.now()-timedelta(days=dias)
+                        count = 0
                         for linha in tab.find('tbody').find_all('tr'):
                             cols = linha.find_all('td')
                             if len(cols)<2: continue
@@ -268,7 +299,10 @@ def sincronizar_investing(supabase, dias=1):
                                 reg = {'produto_id':cfg['produto_id'],'fonte_id':INVESTING_FONTE_ID,
                                        'regiao_id':cfg['regiao_id'],'data_cotacao':di}
                                 reg['preco_usd' if moeda=='USD' else 'preco_brl'] = p
-                                cotacoes.append(reg)
+                                cotacoes.append(reg); count += 1
+                        print(f"   ✅ {count} registros históricos")
+                    else:
+                        print(f"   ⚠️  Tabela histórica não encontrada")
             except Exception as e:
                 print(f"   ⚠️  {cfg['nome']}: {e}")
             time.sleep(3)
@@ -279,7 +313,9 @@ def sincronizar_investing(supabase, dias=1):
     return {'fonte':'Investing.com','inseridos':ok,'erros':err}
 
 
-# ── CEPEA/ESALQ (Selenium — contorna bloqueio 403) ───────────
+# ── CEPEA/ESALQ ───────────────────────────────────────────────
+# Usa Selenium para contornar o bloqueio 403 do servidor.
+# WebDriverWait aguarda a tabela renderizar (JS) antes de parsear.
 
 def sincronizar_cepea(supabase, dias=1):
     print("\n" + "─"*60 + f"\n🌾  CEPEA/ESALQ  [{'dia atual' if dias==1 else f'últimos {dias} dias'}]\n" + "─"*60)
@@ -305,19 +341,33 @@ def sincronizar_cepea(supabase, dias=1):
     lim = (datetime.now() - timedelta(days=dias)).date()
 
     try:
+        from selenium.webdriver.common.by import By
+        from selenium.webdriver.support.ui import WebDriverWait
+        from selenium.webdriver.support import expected_conditions as EC
+
         for cfg in CEPEA_CONFIG:
             print(f"\n   📊 {cfg['nome']}")
             try:
                 driver.get(cfg['url'])
-                time.sleep(4)
+
+                # Aguarda a tabela renderizar (máx 15s)
+                try:
+                    WebDriverWait(driver, 15).until(
+                        EC.presence_of_element_located((By.CSS_SELECTOR, 'table tbody tr td'))
+                    )
+                except Exception:
+                    print(f"   ⚠️  Timeout aguardando tabela — tentando mesmo assim")
+
                 soup    = BeautifulSoup(driver.page_source, 'html.parser')
                 tabelas = soup.find_all('table')
+                print(f"   📋 {len(tabelas)} tabelas encontradas")
 
                 if cfg['tabela_idx'] >= len(tabelas):
-                    print(f"   ⚠️  Tabela não encontrada (total: {len(tabelas)})"); continue
+                    print(f"   ⚠️  Tabela índice {cfg['tabela_idx']} não existe"); continue
 
                 tab    = tabelas[cfg['tabela_idx']]
                 linhas = tab.find('tbody').find_all('tr') if tab.find('tbody') else tab.find_all('tr')[1:]
+                print(f"   📋 {len(linhas)} linhas na tabela")
 
                 valores_dia = {}
                 for linha in linhas:
@@ -347,6 +397,7 @@ def sincronizar_cepea(supabase, dias=1):
 
             except Exception as e:
                 print(f"   ⚠️  {cfg['nome']}: {e}")
+                traceback.print_exc()
     finally:
         driver.quit(); print("\n   🌐 Navegador fechado")
 
