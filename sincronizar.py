@@ -190,19 +190,13 @@ def _detectar_moeda(soup):
     return 'BRL'
 
 
-# ── Investing.com (curl_cffi — bypassa Cloudflare) ────────────
-#
-# curl_cffi emula o fingerprint TLS do Chrome real.
-# Funciona em IPs de datacenter (GitHub Actions, VPS) onde
-# o Selenium headless é bloqueado pelo Cloudflare.
+# ── Investing.com (curl_cffi) ─────────────────────────────────
 
 def _fetch_investing(url: str, tentativas: int = 3) -> BeautifulSoup | None:
-    """Faz o request ao Investing.com com curl_cffi, retorna BeautifulSoup ou None."""
     try:
         from curl_cffi import requests as cf
     except ImportError:
-        print("   ❌ curl_cffi não instalado (pip install curl_cffi)")
-        return None
+        print("   ❌ curl_cffi não instalado"); return None
 
     for i in range(tentativas):
         try:
@@ -220,20 +214,19 @@ def _fetch_investing(url: str, tentativas: int = 3) -> BeautifulSoup | None:
                 titulo = BeautifulSoup(resp.text,'html.parser').find('title')
                 titulo_txt = titulo.text.strip() if titulo else ''
                 if 'Just a moment' in titulo_txt or 'Attention Required' in titulo_txt:
-                    print(f"   ⚠️  Cloudflare ainda ativo (tentativa {i+1}/{tentativas})")
-                    time.sleep(5)
+                    print(f"   ⚠️  Cloudflare ativo (tentativa {i+1}/{tentativas})")
+                    time.sleep(10)
                     continue
                 return BeautifulSoup(resp.text, 'html.parser')
             else:
                 print(f"   ⚠️  HTTP {resp.status_code} (tentativa {i+1}/{tentativas})")
-                time.sleep(3)
+                time.sleep(10)  # aguarda mais entre tentativas 403
         except Exception as e:
-            print(f"   ⚠️  Erro na requisição (tentativa {i+1}/{tentativas}): {e}")
-            time.sleep(3)
+            print(f"   ⚠️  Erro (tentativa {i+1}/{tentativas}): {e}")
+            time.sleep(10)
     return None
 
 def _extrair_preco_investing(soup) -> str | None:
-    """Extrai o preço atual de uma página do Investing.com."""
     seletores = [
         lambda s: s.find(attrs={'data-test': 'instrument-price-last'}),
         lambda s: s.find('div', attrs={'data-test': 'instrument-price-last'}),
@@ -257,8 +250,11 @@ def sincronizar_investing(supabase, dias=1):
 
     cotacoes = []
 
-    for cfg in SCRAPING_CONFIG:
+    for idx, cfg in enumerate(SCRAPING_CONFIG):
         print(f"\n   📊 {cfg['nome']}")
+        # Pausa maior entre produtos para não acionar rate limit do Cloudflare
+        if idx > 0:
+            time.sleep(8)
         try:
             if dias == 1:
                 soup = _fetch_investing(cfg['url_atual'])
@@ -316,7 +312,6 @@ def sincronizar_investing(supabase, dias=1):
 
         except Exception as e:
             print(f"   ⚠️  {cfg['nome']}: {e}")
-        time.sleep(2)
 
     ok, err = upsert_cotacoes(supabase, cotacoes)
     return {'fonte':'Investing.com','inseridos':ok,'erros':err}
