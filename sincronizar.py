@@ -8,9 +8,14 @@ Fontes:
   2. SELIC BCB          → mercado_indicadores
   3. IPCA BCB           → mercado_indicadores
   4. Investing.com      → mercado_cotacoes  (Selenium)
-  5. Yahoo Finance      → mercado_cotacoes  (yfinance) — soja, milho, café, trigo, boi gordo
-  6. Alpha Vantage      → mercado_cotacoes  (API REST)
-  7. CEPEA/ESALQ        → mercado_cotacoes  (Selenium) — feijão, arroz
+  5. CEPEA/ESALQ        → mercado_cotacoes  (Selenium) — feijão, arroz
+
+Uso:
+  python sincronizar.py              → dia atual, todas as fontes
+  python sincronizar.py --dias 7    → últimos 7 dias
+  python sincronizar.py --fonte dolar
+  python sincronizar.py --fonte investing
+  python sincronizar.py --fonte cepea
 """
 
 import os, sys, re, time, argparse, traceback
@@ -30,17 +35,14 @@ from bs4 import BeautifulSoup
 from supabase import create_client, Client
 
 from config_investing import FONTE_ID as INVESTING_FONTE_ID, SCRAPING_CONFIG
-from config_yahoo    import FONTE_ID as YAHOO_FONTE_ID,    YAHOO_CONFIG
-from config_alpha    import FONTE_ID as ALPHA_FONTE_ID,    ALPHA_CONFIG, BASE_URL as ALPHA_BASE_URL
-from config_cepea    import FONTE_ID as CEPEA_FONTE_ID,    CEPEA_CONFIG
+from config_cepea     import FONTE_ID as CEPEA_FONTE_ID,    CEPEA_CONFIG
 
 BCB_FONTE_ID     = 'f64f3c6e-9bdd-4e82-a158-983733760d9a'
 SELIC_PRODUTO_ID = '02ce74c6-280d-421f-ab05-9a04fd729692'
 IPCA_PRODUTO_ID  = '81719845-bca4-44ff-838d-11411c9136ed'
 
-SUPABASE_URL      = os.environ.get('SUPABASE_URL')
-SUPABASE_KEY      = os.environ.get('SUPABASE_KEY')
-ALPHA_VANTAGE_KEY = os.environ.get('ALPHA_VANTAGE_KEY')
+SUPABASE_URL = os.environ.get('SUPABASE_URL')
+SUPABASE_KEY = os.environ.get('SUPABASE_KEY')
 
 
 def conectar_supabase():
@@ -148,7 +150,7 @@ def sincronizar_ipca(supabase, dias=1):
         return {'fonte':'IPCA BCB','inseridos':0,'erros':1,'excecao':str(e)}
 
 
-# ── Selenium (compartilhado entre Investing e CEPEA) ─────────
+# ── Selenium (compartilhado Investing.com e CEPEA) ────────────
 
 def _criar_driver():
     try:
@@ -202,7 +204,7 @@ def _detectar_moeda(soup):
     return 'BRL'
 
 
-# ── Investing.com ────────────────────────────────────────────
+# ── Investing.com ─────────────────────────────────────────────
 
 def sincronizar_investing(supabase, dias=1):
     print("\n" + "─"*60 + f"\n📈  INVESTING.COM  [{'dia atual' if dias==1 else f'últimos {dias} dias'}]\n" + "─"*60)
@@ -236,7 +238,7 @@ def sincronizar_investing(supabase, dias=1):
                         if e: ps = e.get_text(strip=True); break
                     if ps:
                         p = _limpar_numero(ps)
-                        if p and p>0:
+                        if p and p > 0:
                             reg = {'produto_id':cfg['produto_id'],'fonte_id':INVESTING_FONTE_ID,
                                    'regiao_id':cfg['regiao_id'],'data_cotacao':datetime.now().strftime('%Y-%m-%d')}
                             reg['preco_usd' if moeda=='USD' else 'preco_brl'] = p
@@ -262,7 +264,7 @@ def sincronizar_investing(supabase, dias=1):
                             di = _converter_data(cols[0].get_text(strip=True))
                             if not di or datetime.strptime(di,'%Y-%m-%d')<lim: break
                             p = _limpar_numero(cols[1].get_text(strip=True))
-                            if p and p>0:
+                            if p and p > 0:
                                 reg = {'produto_id':cfg['produto_id'],'fonte_id':INVESTING_FONTE_ID,
                                        'regiao_id':cfg['regiao_id'],'data_cotacao':di}
                                 reg['preco_usd' if moeda=='USD' else 'preco_brl'] = p
@@ -275,70 +277,6 @@ def sincronizar_investing(supabase, dias=1):
 
     ok, err = upsert_cotacoes(supabase, cotacoes)
     return {'fonte':'Investing.com','inseridos':ok,'erros':err}
-
-
-# ── Yahoo Finance ────────────────────────────────────────────
-
-def sincronizar_yahoo(supabase, dias=1):
-    print("\n" + "─"*60 + f"\n📈  YAHOO FINANCE  [{'dia atual' if dias==1 else f'últimos {dias} dias'}]\n" + "─"*60)
-    try:
-        import yfinance as yf
-    except ImportError:
-        return {'fonte':'Yahoo Finance','inseridos':0,'erros':0,'aviso':'yfinance não instalado'}
-
-    registros = []
-    for cfg in YAHOO_CONFIG:
-        div = cfg.get('divisor',1)
-        print(f"   📊 {cfg['nome']} ({cfg['ticker']}) divisor:{div}")
-        try:
-            hist = yf.Ticker(cfg['ticker']).history(period='1d' if dias==1 else f'{dias}d')
-            if hist.empty: print(f"   ⚠️  Sem dados"); continue
-            for idx, row in hist.iterrows():
-                preco = round(float(row['Close'])/div, 4)
-                reg = {'produto_id':cfg['produto_id'],'fonte_id':YAHOO_FONTE_ID,
-                       'regiao_id':cfg['regiao_id'],'data_cotacao':idx.strftime('%Y-%m-%d')}
-                reg['preco_usd' if cfg['moeda']=='USD' else 'preco_brl'] = preco
-                registros.append(reg)
-            print(f"   ✅ {len(hist)} registros")
-        except Exception as e:
-            print(f"   ⚠️  {cfg['nome']}: {e}")
-
-    ok, err = upsert_cotacoes(supabase, registros)
-    return {'fonte':'Yahoo Finance','inseridos':ok,'erros':err}
-
-
-# ── Alpha Vantage ────────────────────────────────────────────
-
-def sincronizar_alpha(supabase, dias=1):
-    print("\n" + "─"*60 + f"\n📈  ALPHA VANTAGE  [{'dia atual' if dias==1 else f'últimos {dias} dias'}]\n" + "─"*60)
-    if not ALPHA_VANTAGE_KEY:
-        return {'fonte':'Alpha Vantage','inseridos':0,'erros':0,'aviso':'ALPHA_VANTAGE_KEY não configurada'}
-
-    registros = []; lim = (datetime.now()-timedelta(days=dias)).strftime('%Y-%m-%d')
-    for cfg in ALPHA_CONFIG:
-        print(f"   📊 {cfg['nome']} ({cfg['function']})")
-        try:
-            resp = requests.get(ALPHA_BASE_URL, timeout=20,
-                params={'function':cfg['function'],'interval':'daily','datatype':'json','apikey':ALPHA_VANTAGE_KEY})
-            resp.raise_for_status()
-            serie = resp.json().get('data',[])
-            if not serie: print(f"   ⚠️  Sem dados"); continue
-            count = 0
-            for p in serie:
-                di = p.get('date','')
-                if di < lim: break
-                v = p.get('value','')
-                if not v or v=='.': continue
-                reg = {'produto_id':cfg['produto_id'],'fonte_id':ALPHA_FONTE_ID,
-                       'regiao_id':cfg['regiao_id'],'data_cotacao':di}
-                reg['preco_usd' if cfg['moeda']=='USD' else 'preco_brl'] = round(float(v),4)
-                registros.append(reg); count += 1
-            print(f"   ✅ {count} registros"); time.sleep(13)
-        except Exception as e:
-            print(f"   ⚠️  {cfg['nome']}: {e}")
-
-    ok, err = upsert_cotacoes(supabase, registros)
-    return {'fonte':'Alpha Vantage','inseridos':ok,'erros':err}
 
 
 # ── CEPEA/ESALQ (Selenium — contorna bloqueio 403) ───────────
@@ -371,12 +309,12 @@ def sincronizar_cepea(supabase, dias=1):
             print(f"\n   📊 {cfg['nome']}")
             try:
                 driver.get(cfg['url'])
-                time.sleep(4)  # aguarda renderização completa
+                time.sleep(4)
                 soup    = BeautifulSoup(driver.page_source, 'html.parser')
                 tabelas = soup.find_all('table')
 
                 if cfg['tabela_idx'] >= len(tabelas):
-                    print(f"   ⚠️  Tabela {cfg['tabela_idx']} não encontrada (total: {len(tabelas)})"); continue
+                    print(f"   ⚠️  Tabela não encontrada (total: {len(tabelas)})"); continue
 
                 tab    = tabelas[cfg['tabela_idx']]
                 linhas = tab.find('tbody').find_all('tr') if tab.find('tbody') else tab.find_all('tr')[1:]
@@ -423,8 +361,6 @@ FONTES = {
     'selic':     sincronizar_selic,
     'ipca':      sincronizar_ipca,
     'investing': sincronizar_investing,
-    'yahoo':     sincronizar_yahoo,
-    'alpha':     sincronizar_alpha,
     'cepea':     sincronizar_cepea,
 }
 
