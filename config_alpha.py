@@ -5,13 +5,10 @@ Fonte: API REST gratuita (25 req/dia no plano free — suficiente para 4 commodi
 API Key: configurada via variável de ambiente ALPHA_VANTAGE_KEY
 """
 
-# ID da fonte Alpha Vantage no banco
-FONTE_ID = 'alpha-vantage-001'  # ajuste para o UUID real em mercado_fontes
+FONTE_ID = '70a47e77-abc1-49a3-8775-235975e78420'
 
-# Região "Nacional"
 REGIAO_NACIONAL_ID = '689348a6-e539-4d57-9f68-9bf8b9a437c1'
 
-# IDs de produtos
 PRODUTOS = {
     'boi_gordo':    '9e382636-0b57-482b-a836-522da43b6228',
     'cafe_arabica': 'b65effe8-94fb-4f73-8404-7bdeddb74565',
@@ -19,7 +16,6 @@ PRODUTOS = {
     'milho':        '553e75be-a732-4ff5-9b93-11bb8861114a',
 }
 
-# Mapeamento função Alpha Vantage → produto_id
 # Docs: https://www.alphavantage.co/documentation/#commodities
 ALPHA_CONFIG = [
     {
