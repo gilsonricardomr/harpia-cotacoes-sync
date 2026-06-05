@@ -2,15 +2,14 @@ name: Sincronizar Cotações
 
 on:
   schedule:
-    # 09h15 BRT = 12h15 UTC — BCB + Café/Milho + CEPEA
+    # 09h15 BRT = 12h15 UTC — BCB + Café/Milho
     - cron: '15 12 * * 1-5'
     # 10h17 BRT = 13h17 UTC — Soja + Boi Gordo
     - cron: '17 13 * * 1-5'
-
   workflow_dispatch:
     inputs:
       fonte:
-        description: 'Fonte: bcb | cafe_milho | soja_boi | cepea (vazio = todas)'
+        description: 'Fonte: bcb | cafe_milho | soja_boi (vazio = todas)'
         required: false
         default: ''
 
@@ -37,15 +36,9 @@ jobs:
       - name: Instalar dependências
         run: pip install -r requirements.txt
 
-      - name: Instalar Chrome (para CEPEA via Selenium)
-        uses: browser-actions/setup-chrome@v1
-        with:
-          chrome-version: stable
-
       - name: Determinar fonte pelo horário
         id: fonte
         run: |
-          # Se rodou manualmente com fonte específica, usa ela
           FONTE_INPUT="${{ github.event.inputs.fonte }}"
           if [ -n "$FONTE_INPUT" ]; then
             echo "fontes=$FONTE_INPUT" >> $GITHUB_OUTPUT
@@ -53,17 +46,15 @@ jobs:
             exit 0
           fi
 
-          # Detecta pelo horário UTC atual
           HORA=$(date -u +%H%M)
           if [ "$HORA" -ge "1215" ] && [ "$HORA" -lt "1300" ]; then
-            echo "fontes=bcb cafe_milho cepea" >> $GITHUB_OUTPUT
-            echo "label=09h15 BRT (BCB + Café/Milho + CEPEA)" >> $GITHUB_OUTPUT
+            echo "fontes=bcb cafe_milho" >> $GITHUB_OUTPUT
+            echo "label=09h15 BRT (BCB + Café/Milho)" >> $GITHUB_OUTPUT
           elif [ "$HORA" -ge "1317" ] && [ "$HORA" -lt "1400" ]; then
             echo "fontes=soja_boi" >> $GITHUB_OUTPUT
             echo "label=10h17 BRT (Soja + Boi Gordo)" >> $GITHUB_OUTPUT
           else
-            # Fallback manual: roda tudo
-            echo "fontes=bcb cafe_milho soja_boi cepea" >> $GITHUB_OUTPUT
+            echo "fontes=bcb cafe_milho soja_boi" >> $GITHUB_OUTPUT
             echo "label=todas as fontes" >> $GITHUB_OUTPUT
           fi
 
