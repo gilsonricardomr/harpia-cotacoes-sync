@@ -3,9 +3,9 @@ name: Sincronizar Cotações
 on:
   schedule:
     # 09h15 BRT = 12h15 UTC — BCB + Café/Milho
-    - cron: '15 12 * * 1-5'
+    - cron: '11 8 * * 1-5'
     # 10h17 BRT = 13h17 UTC — Soja + Boi Gordo
-    - cron: '17 13 * * 1-5'
+    - cron: '17 14 * * 1-5'
   workflow_dispatch:
     inputs:
       fonte:
